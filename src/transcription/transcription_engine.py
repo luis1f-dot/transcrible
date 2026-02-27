@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 # Diretório de cache local → evita re-download e não polui ~/.cache de outros projetos.
 _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "whisper"
+
+# Timeout máximo em segundos para a inferência do Whisper.
+# Regra de bolso: ~1 min de CPU por 10 min de áudio no modelo base.
+# Para reuniões de até 1h, 10 min de timeout é margem segura.
+_TRANSCRIPTION_TIMEOUT: int = 600
 
 ModelSize = Literal["tiny", "base", "small"]
 
@@ -81,16 +87,37 @@ class TranscriptionEngine:
             )
 
             self._on_status("Transcrevendo áudio... Por favor, aguarde.")
-            segments, info = model.transcribe(
-                str(wav_path),
-                language=language,
-                beam_size=5,           # beam_size=1 é greedy (mais rápido, menos preciso)
-                vad_filter=True,       # remove silêncios longos antes da inferência
-                vad_parameters={
-                    "min_silence_duration_ms": 500,
-                    "speech_pad_ms": 400,
-                },
-            )
+
+            def _run_transcribe():
+                return model.transcribe(
+                    str(wav_path),
+                    language=language,
+                    beam_size=5,           # beam_size=1 é greedy (mais rápido, menos preciso)
+                    vad_filter=True,       # remove silêncios longos antes da inferência
+                    vad_parameters={
+                        "min_silence_duration_ms": 500,
+                        "speech_pad_ms": 400,
+                    },
+                )
+
+            # Envolve a inferência em ThreadPoolExecutor para aplicar timeout.
+            # Por que não usar signal.alarm? Não funciona em Windows nem em
+            # threads secundárias — ThreadPoolExecutor.result(timeout) é a
+            # abordagem idiomática e portável.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="WhisperInfer") as pool:
+                future = pool.submit(_run_transcribe)
+                try:
+                    segments, info = future.result(timeout=_TRANSCRIPTION_TIMEOUT)
+                except FuturesTimeoutError:
+                    logger.error(
+                        "[TranscriptionEngine] Timeout após %ds — WAV preservado.",
+                        _TRANSCRIPTION_TIMEOUT,
+                    )
+                    self._on_status(
+                        f"[ERRO] Transcrição excedeu {_TRANSCRIPTION_TIMEOUT // 60} min. "
+                        "O arquivo WAV foi preservado para retry manual."
+                    )
+                    raise RuntimeError("TranscriptionTimeout")
 
             # `segments` é um gerador lazy — iterar aqui dispara a inferência real.
             lines = [seg.text.strip() for seg in segments if seg.text.strip()]

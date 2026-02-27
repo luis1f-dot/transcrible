@@ -13,6 +13,12 @@ __pycache__/
 # Artefato de áudio temporário (nunca deve ser versionado)
 temp_meeting.wav
 
+# Logs da aplicação
+.logs/
+
+# Cache do modelo Whisper (binário grande, re-baixado automaticamente)
+.cache/whisper/
+
 # Outputs de transcrição gerados pelo app
 *.txt
 *.md

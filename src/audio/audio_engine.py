@@ -234,12 +234,30 @@ class AudioEngine:
     def _capture_mic(self, device_index: int) -> None:
         """
         Thread A — abre InputStream do microfone e empurra chunks para mic_queue.
-        Callbacks de sounddevice rodam em thread separada interna; usamos
-        queue.Queue (thread-safe por design) para passar os dados ao mixer.
+
+        Watchdog de hardware: 3 erros consecutivos no callback (ex: microfone
+        desconectado mid-session) disparam o encerramento automático da gravação.
+        Por que 3 e não 1? Um único `input_underflow` pode ser transitório
+        (ex: spike de CPU). Três consecutivos indicam falha real do hardware.
         """
+        _err_count = 0
+        _ERR_THRESHOLD = 3
+
         def _callback(indata: np.ndarray, frames: int, time, status) -> None:  # noqa: ARG001
+            nonlocal _err_count
             if status:
-                logger.warning("[Mic] %s", status)
+                _err_count += 1
+                logger.warning("[Mic] Status=%s (erro %d/%d)", status, _err_count, _ERR_THRESHOLD)
+                if _err_count >= _ERR_THRESHOLD:
+                    self._on_status(
+                        "[AVISO] Microfone perdeu sinal após 3 erros consecutivos "
+                        "— gravação encerrada automaticamente."
+                    )
+                    logger.error("[Mic] Watchdog ativado: encerramento forçado da gravação.")
+                    self._stop_event.set()
+                    return
+            else:
+                _err_count = 0  # reset ao receber frame válido
             if not self._stop_event.is_set():
                 self._mic_queue.put(_to_mono(indata.copy()))
 
@@ -255,9 +273,10 @@ class AudioEngine:
                 self._stop_event.wait()
         except sd.PortAudioError as exc:
             logger.error("[Mic] PortAudioError: %s", exc)
-            self._on_status(f"[ERRO] Microfone: {exc}")
+            self._on_status(f"[ERRO] Microfone indisponível: {exc}")
+            self._stop_event.set()  # garante encerramento do mixer
         finally:
-            self._mic_queue.put(None)  # poison pill se sair por exceção
+            self._mic_queue.put(None)  # poison pill garante que mixer não fique bloqueado
 
     def _capture_loopback(self, device_index: int) -> None:
         """

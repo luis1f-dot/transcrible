@@ -1,6 +1,6 @@
 # src/ui/app_window.py
 # Módulo 1 — UI Manager (Frontend)
-# FASE 3: Orquestração completa — AudioEngine → TranscriptionEngine → IOManager.
+# FASE 4: Orquestração final — fail-safes, watchdog, seletores de formato/modelo.
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ class AppWindow(ctk.CTk):
         self.speaker_dropdown.grid(row=2, column=1, padx=15, pady=(6, 14), sticky="ew")
 
     def _build_meeting_block(self) -> None:
-        """Bloco 2 — Título da reunião e seletor de diretório de saída."""
+        """Bloco 2 — Título, formato de saída, modelo Whisper e seletor de diretório."""
         frame = ctk.CTkFrame(self, corner_radius=10)
         frame.grid(row=1, column=0, padx=20, pady=8, sticky="ew")
         frame.grid_columnconfigure(1, weight=1)
@@ -95,29 +95,50 @@ class AppWindow(ctk.CTk):
         ctk.CTkLabel(
             frame, text="Configuração da Reunião",
             font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, columnspan=3, padx=15, pady=(12, 6), sticky="w")
+        ).grid(row=0, column=0, columnspan=4, padx=15, pady=(12, 6), sticky="w")
 
+        # Linha 1: Título
         ctk.CTkLabel(frame, text="Título da Reunião:").grid(
             row=1, column=0, padx=15, pady=6, sticky="w"
         )
         self.title_entry = ctk.CTkEntry(
             frame, placeholder_text="Ex: Planning Sprint 15"
         )
-        self.title_entry.grid(row=1, column=1, columnspan=2, padx=15, pady=6, sticky="ew")
+        self.title_entry.grid(row=1, column=1, columnspan=3, padx=15, pady=6, sticky="ew")
 
-        ctk.CTkLabel(frame, text="Diretório de Saída:").grid(
+        # Linha 2: Formato de Saída + Modelo Whisper
+        ctk.CTkLabel(frame, text="Formato:").grid(
             row=2, column=0, padx=15, pady=6, sticky="w"
+        )
+        self.fmt_dropdown = ctk.CTkOptionMenu(
+            frame, values=[".txt", ".md"], width=80
+        )
+        self.fmt_dropdown.set(".txt")
+        self.fmt_dropdown.grid(row=2, column=1, padx=(15, 20), pady=6, sticky="w")
+
+        ctk.CTkLabel(frame, text="Modelo Whisper:").grid(
+            row=2, column=2, padx=(0, 6), pady=6, sticky="w"
+        )
+        self.model_dropdown = ctk.CTkOptionMenu(
+            frame, values=["tiny", "base", "small"], width=100
+        )
+        self.model_dropdown.set("base")
+        self.model_dropdown.grid(row=2, column=3, padx=(0, 15), pady=6, sticky="w")
+
+        # Linha 3: Diretório de Saída
+        ctk.CTkLabel(frame, text="Diretório de Saída:").grid(
+            row=3, column=0, padx=15, pady=6, sticky="w"
         )
         self.dir_entry = ctk.CTkEntry(
             frame, placeholder_text="Nenhum diretório selecionado..."
         )
-        self.dir_entry.grid(row=2, column=1, padx=(15, 6), pady=(6, 14), sticky="ew")
+        self.dir_entry.grid(row=3, column=1, columnspan=2, padx=(15, 6), pady=(6, 14), sticky="ew")
 
         self.dir_btn = ctk.CTkButton(
             frame, text="Procurar...", width=110,
             command=self._select_dir
         )
-        self.dir_btn.grid(row=2, column=2, padx=(0, 15), pady=(6, 14))
+        self.dir_btn.grid(row=3, column=3, padx=(0, 15), pady=(6, 14))
 
     def _build_console_block(self) -> None:
         """Bloco 3 — Console de Status readonly para logs de operação."""
@@ -233,9 +254,9 @@ class AppWindow(ctk.CTk):
                 state="normal",
             )
             self._audio_engine.start(mic_idx, lb_idx, self._output_dir)
-
-        else:
-            # ── Encerramento ──────────────────────────────────────────────
+            # Inicia polling para detectar encerramento automático (watchdog)
+            self.after(1000, self._poll_watchdog)
+            # Encerramento manual
             self._is_recording = False
             self.record_btn.configure(
                 text="Aguarde...",
@@ -245,6 +266,8 @@ class AppWindow(ctk.CTk):
             # Captura o título agora (na thread principal) antes de entrar na worker thread.
             meeting_title = self.title_entry.get().strip() or "reuniao"
             output_dir    = self._output_dir
+            model_size    = self.model_dropdown.get()               # "tiny" / "base" / "small"
+            fmt           = self.fmt_dropdown.get().lstrip(".")     # "txt" ou "md"
 
             def _stop_and_restore() -> None:
                 """
@@ -272,18 +295,32 @@ class AppWindow(ctk.CTk):
 
                 # ── Etapa 2: transcrição ──────────────────────────────────
                 try:
-                    transcription = self._transcription_engine.transcribe(wav_path)
+                    transcription = self._transcription_engine.transcribe(
+                        wav_path, model_size=model_size
+                    )
                 except Exception:
-                    # Erro já logado pelo TranscriptionEngine via _on_status
+                    # Erro já logado pelo TranscriptionEngine via _on_status.
+                    # WAV não é deletado — usuário pode tentar transcrever manualmente.
+                    self.after(0, lambda: self._log(
+                        f"[INFO] WAV preservado em: {wav_path} — é possível retry manual."
+                    ))
                     return
 
-                # ── Etapa 3: salvar documento ─────────────────────────────
+                # ── Etapa 3: validar dir + salvar documento ──────────────────
+                if not output_dir.exists():
+                    self.after(0, lambda: self._log(
+                        f"[ERRO] Diretório de saída não existe mais: {output_dir}"
+                    ))
+                    self.after(0, lambda: self._log(
+                        f"[INFO] WAV preservado em: {wav_path} — salve o arquivo manualmente."
+                    ))
+                    return  # WAV não é deletado
                 try:
                     file_path = self._io_manager.save(
                         title=meeting_title,
                         transcription=transcription,
                         output_dir=output_dir,
-                        fmt="txt",
+                        fmt=fmt,
                     )
                 except Exception:
                     # Erro já logado pelo IOManager via _on_status
@@ -298,6 +335,22 @@ class AppWindow(ctk.CTk):
                 self._io_manager.cleanup(wav_path)
 
             threading.Thread(target=_stop_and_restore, daemon=True, name="StopHandler").start()
+    def _poll_watchdog(self) -> None:
+        """
+        Verifica a cada 1s se o AudioEngine encerrou por watchdog (hardware fault).
+        Se o stop_event está ativo mas a UI ainda exibe o botão de 'Finalizar',
+        significa que o encerramento foi involuntário — dispara o pipeline
+        automático para não deixar a UI travada e o WAV orphaned.
+        """
+        if not self._is_recording:
+            return  # usuário já clicou Finalizar manualmente — não reprogramar
+
+        if self._audio_engine._stop_event.is_set():
+            self._log("[AUTO] Watchdog detectou encerramento do hardware — iniciando pipeline...")
+            self._toggle_record()  # aciona o fluxo de encerramento completo
+        else:
+            self.after(1000, self._poll_watchdog)  # reagenda para daqui 1s
+
     def _show_transcription(self, text: str) -> None:
         """
         Exibe a transcrição completa no console de status.

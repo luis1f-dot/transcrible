@@ -114,21 +114,30 @@ class IOManager:
         """
         Converte o título em um nome de arquivo válido para Windows e Linux.
 
-        Processo:
+        Processo (whitelist — mais seguro que blacklist):
             1. Normaliza Unicode NFKD (decompõe acentos).
             2. Descarta bytes não-ASCII (remove acentos e diacríticos).
-            3. Remove caracteres proibidos no Windows: \\ / : * ? " < > |
-            4. Colapsa espaços em sublinhado.
+            3. Mantém apenas: letras, dígitos, espaços e hífens (tudo mais é descartado).
+            4. Colapsa espaços em sublinhado e remove underscores duplicados.
             5. Trunca em 60 chars para evitar paths longos.
 
-        Exemplo: "Reunião: Q1/2026?" → "Reuniao_Q12026"
+        Por que whitelist em vez de blacklist?
+        A blacklist requer lista exaustiva de chars proibidos por OS.
+        A whitelist `\\w` (word chars) + hífens é universalmente segura.
+
+        Exemplos:
+            "Reunião: Q1/2026?" → "Reuniao_Q12026"
+            "!!!###???"         → "reuniao"  (fallback)
+            "Planning Sprint 15" → "Planning_Sprint_15"
         """
         nfkd = unicodedata.normalize("NFKD", title)
         ascii_str = nfkd.encode("ascii", "ignore").decode("ascii")
-        cleaned = re.sub(r'[\\/:*?"<>|]', "", ascii_str)
+        # Whitelist: mantém apenas word chars (\w = [a-zA-Z0-9_]), espaços e hífens
+        cleaned = re.sub(r"[^\w\s\-]", "", ascii_str)
         cleaned = re.sub(r"\s+", "_", cleaned.strip())
         cleaned = re.sub(r"_+", "_", cleaned)          # colapsa múltiplos underscores
-        return cleaned[:60] or "reuniao"               # fallback se título for só símbolos
+        cleaned = cleaned.strip("_")                   # remove underscores nas bordas
+        return cleaned[:60] or "reuniao"               # fallback se resultado for vazio
 
     @staticmethod
     def _build_document(
