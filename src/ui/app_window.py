@@ -1,7 +1,6 @@
 # src/ui/app_window.py
 # Módulo 1 — UI Manager (Frontend)
-# FASE 2: Integração com AudioEngine real — dropdowns populados com devices reais,
-# botão de gravação conectado às threads de captura.
+# FASE 3: Orquestração completa — AudioEngine → TranscriptionEngine → IOManager.
 
 from __future__ import annotations
 
@@ -12,6 +11,8 @@ from pathlib import Path
 import customtkinter as ctk
 
 from audio.audio_engine import AudioEngine
+from transcription.transcription_engine import TranscriptionEngine
+from io_manager.io_manager import IOManager
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -34,9 +35,11 @@ class AppWindow(ctk.CTk):
         self._is_recording: bool = False
         self._output_dir: Path | None = None
 
-        # AudioEngine recebe o callback de log para poder escrever no console
-        # sem criar dependência do módulo de áudio sobre customtkinter.
-        self._audio_engine = AudioEngine(on_status=self._log)
+        # Todos os módulos recebem o mesmo callback de log — nenhum deles
+        # conhece customtkinter diretamente (Separation of Concerns).
+        self._audio_engine       = AudioEngine(on_status=self._log)
+        self._transcription_engine = TranscriptionEngine(on_status=self._log)
+        self._io_manager         = IOManager(on_status=self._log)
 
         # Mapas índice → device_id real (preenchidos em _populate_devices)
         self._mic_map:      list[tuple[int, str]] = []
@@ -239,18 +242,70 @@ class AppWindow(ctk.CTk):
                 state="disabled",
             )
 
+            # Captura o título agora (na thread principal) antes de entrar na worker thread.
+            meeting_title = self.title_entry.get().strip() or "reuniao"
+            output_dir    = self._output_dir
+
             def _stop_and_restore() -> None:
+                """
+                Orquestrador completo do pipeline pós-gravação.
+                Sequência: AudioEngine.stop() → TranscriptionEngine.transcribe()
+                           → IOManager.save() → IOManager.cleanup()
+                Cada etapa só inicia se a anterior foi bem-sucedida.
+                Roda inteiramente fora da thread principal para nunca bloquear a UI.
+                """
+                # ── Etapa 1: encerra captura de áudio ─────────────────────
                 wav_path = self._audio_engine.stop()
-                # Restaura botão na thread principal após o stop completar
-                self.after(0, lambda: self.record_btn.configure(
-                    text="⏺  Iniciar Gravação",
-                    fg_color="#C0392B",
-                    hover_color="#922B21",
-                    state="normal",
-                ))
-                if wav_path:
-                    self.after(0, lambda: self._log(
-                        f"Áudio pronto para transcrição: {wav_path} — [Fase 3 pendente]"
-                    ))
+
+                def _restore_btn() -> None:
+                    self.record_btn.configure(
+                        text="⏺  Iniciar Gravação",
+                        fg_color="#C0392B",
+                        hover_color="#922B21",
+                        state="normal",
+                    )
+                self.after(0, _restore_btn)
+
+                if not wav_path:
+                    self.after(0, lambda: self._log("[ERRO] WAV não foi gerado — abortando transcrição."))
+                    return
+
+                # ── Etapa 2: transcrição ──────────────────────────────────
+                try:
+                    transcription = self._transcription_engine.transcribe(wav_path)
+                except Exception:
+                    # Erro já logado pelo TranscriptionEngine via _on_status
+                    return
+
+                # ── Etapa 3: salvar documento ─────────────────────────────
+                try:
+                    file_path = self._io_manager.save(
+                        title=meeting_title,
+                        transcription=transcription,
+                        output_dir=output_dir,
+                        fmt="txt",
+                    )
+                except Exception:
+                    # Erro já logado pelo IOManager via _on_status
+                    return
+
+                # ── Etapa 4: exibir transcrição na UI + GC ────────────────
+                # Copia local para evitar closure binding tardio
+                _text = transcription
+                self.after(0, lambda: self._show_transcription(_text))
+
+                # GC só após confirmar que o .txt foi escrito com sucesso
+                self._io_manager.cleanup(wav_path)
 
             threading.Thread(target=_stop_and_restore, daemon=True, name="StopHandler").start()
+    def _show_transcription(self, text: str) -> None:
+        """
+        Exibe a transcrição completa no console de status.
+        Chamado via `self.after(0, ...)` — sempre na thread principal.
+        """
+        self._log("─" * 44)
+        self._log("TRANSCRIÇÃO:")
+        self._log("─" * 44)
+        for line in text.splitlines():
+            self._log(line)
+        self._log("─" * 44)

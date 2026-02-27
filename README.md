@@ -37,5 +37,5 @@ src/
 |------|-----------|--------|
 | 1 | Estrutura Base e UI Mock | ✅ Concluída |
 | 2 | Motor de Áudio (WASAPI) | ✅ Concluída |
-| 3 | Integração Whisper e I/O | 🔲 Pendente |
+| 3 | Integração Whisper e I/O | ✅ Concluída |
 | 4 | Orquestração e Testes | 🔲 Pendente |
