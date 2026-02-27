@@ -1,16 +1,20 @@
 # src/ui/app_window.py
 # Módulo 1 — UI Manager (Frontend)
-# FASE 1: Mock visual — sem lógica de negócio conectada.
-# Propósito: validar layout e fluxo de interação antes da integração com os módulos de áudio e transcrição.
+# FASE 2: Integração com AudioEngine real — dropdowns populados com devices reais,
+# botão de gravação conectado às threads de captura.
+
+from __future__ import annotations
+
+import threading
+import tkinter.filedialog as filedialog
+from pathlib import Path
 
 import customtkinter as ctk
 
+from audio.audio_engine import AudioEngine
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-# Dados MOCK — serão substituídos pela varredura real do sounddevice na Fase 2
-MOCK_MICS = ["[MOCK] Microfone (Realtek HD Audio)", "[MOCK] Headset USB"]
-MOCK_SPEAKERS = ["[MOCK] Alto-falantes (Realtek HD Audio)", "[MOCK] HDMI Output"]
 
 
 class AppWindow(ctk.CTk):
@@ -18,8 +22,8 @@ class AppWindow(ctk.CTk):
     Janela principal do MeetRecorder & Transcriber Local.
 
     Responsabilidade: exclusivamente renderizar a UI e capturar intenções do usuário.
-    Em Fases futuras, os callbacks mock serão substituídos por chamadas reais
-    ao AudioEngine e ao TranscriptionEngine via threading.
+    A lógica de negócio vive nos módulos audio/, transcription/ e io_manager/.
+    Esta classe apenas despacha eventos e exibe feedback de estado.
     """
 
     def __init__(self):
@@ -28,7 +32,19 @@ class AppWindow(ctk.CTk):
         self.geometry("700x640")
         self.resizable(False, False)
         self._is_recording: bool = False
+        self._output_dir: Path | None = None
+
+        # AudioEngine recebe o callback de log para poder escrever no console
+        # sem criar dependência do módulo de áudio sobre customtkinter.
+        self._audio_engine = AudioEngine(on_status=self._log)
+
+        # Mapas índice → device_id real (preenchidos em _populate_devices)
+        self._mic_map:      list[tuple[int, str]] = []
+        self._loopback_map: list[tuple[int, str]] = []
+
         self._build_layout()
+        # Popula dropdowns após o layout estar pronto
+        self._populate_devices()
 
     # ──────────────────────────────────────────────────────────────────────
     # Layout
@@ -57,13 +73,14 @@ class AppWindow(ctk.CTk):
         ctk.CTkLabel(frame, text="Microfone (Entrada):").grid(
             row=1, column=0, padx=15, pady=6, sticky="w"
         )
-        self.mic_dropdown = ctk.CTkOptionMenu(frame, values=MOCK_MICS)
+        # Placeholder até _populate_devices() completar
+        self.mic_dropdown = ctk.CTkOptionMenu(frame, values=["Carregando..."])
         self.mic_dropdown.grid(row=1, column=1, padx=15, pady=6, sticky="ew")
 
         ctk.CTkLabel(frame, text="Alto-falante (Loopback):").grid(
             row=2, column=0, padx=15, pady=6, sticky="w"
         )
-        self.speaker_dropdown = ctk.CTkOptionMenu(frame, values=MOCK_SPEAKERS)
+        self.speaker_dropdown = ctk.CTkOptionMenu(frame, values=["Carregando..."])
         self.speaker_dropdown.grid(row=2, column=1, padx=15, pady=(6, 14), sticky="ew")
 
     def _build_meeting_block(self) -> None:
@@ -95,7 +112,7 @@ class AppWindow(ctk.CTk):
 
         self.dir_btn = ctk.CTkButton(
             frame, text="Procurar...", width=110,
-            command=self._mock_select_dir
+            command=self._select_dir
         )
         self.dir_btn.grid(row=2, column=2, padx=(0, 15), pady=(6, 14))
 
@@ -120,12 +137,12 @@ class AppWindow(ctk.CTk):
             font=ctk.CTkFont(size=16, weight="bold"),
             fg_color="#C0392B",
             hover_color="#922B21",
-            command=self._mock_toggle_record,
+            command=self._toggle_record,
         )
         self.record_btn.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="ew")
 
     # ──────────────────────────────────────────────────────────────────────
-    # Helpers / Callbacks Mock
+    # Helpers e Callbacks reais
     # ──────────────────────────────────────────────────────────────────────
 
     def _log(self, message: str) -> None:
@@ -135,42 +152,105 @@ class AppWindow(ctk.CTk):
         Por que habilitar/desabilitar `state`? O CTkTextbox exige `state="normal"`
         para aceitar escrita programática e `state="disabled"` para impedir
         edição pelo usuário — diferente do Tk padrão.
-        """
-        self.console.configure(state="normal")
-        self.console.insert("end", f"> {message}\n")
-        self.console.configure(state="disabled")
-        self.console.see("end")
 
-    def _mock_select_dir(self) -> None:
+        Por que `after(0, ...)`? AudioEngine chama este callback a partir de
+        Worker Threads. Tkinter não é thread-safe: qualquer atualização de widget
+        deve ocorrer na thread principal. `after(0, ...)` agenda a execução no
+        event loop da UI sem delay, resolvendo o problema de forma idiomática.
         """
-        MOCK — simula retorno de `tkinter.filedialog.askdirectory()`.
-        Substituído na Fase 1 final por chamada real ao filedialog.
-        """
-        fake_path = "C:/Users/Usuario/Documentos/Reunioes"
-        self.dir_entry.delete(0, "end")
-        self.dir_entry.insert(0, fake_path)
-        self._log(f"Diretório configurado: {fake_path}")
+        def _write() -> None:
+            self.console.configure(state="normal")
+            self.console.insert("end", f"> {message}\n")
+            self.console.configure(state="disabled")
+            self.console.see("end")
 
-    def _mock_toggle_record(self) -> None:
-        """
-        MOCK — alterna estado visual do botão sem capturar áudio real.
-        Na Fase 4 (Orquestração), este método despachará eventos para o
-        AudioEngine e TranscriptionEngine via threading.Thread.
-        """
-        self._is_recording = not self._is_recording
+        # Se chamado da thread principal, executa direto; senão, agenda via after()
+        try:
+            self.after(0, _write)
+        except RuntimeError:
+            pass  # janela já destruída — ignorar log tardio
 
-        if self._is_recording:
+    def _populate_devices(self) -> None:
+        """
+        Popula os dropdowns com devices reais via AudioEngine.list_devices().
+        Executa em thread separada para não travar a inicialização da janela.
+        """
+        def _load() -> None:
+            mics, loopbacks = self._audio_engine.list_devices()
+            self._mic_map = mics
+            self._loopback_map = loopbacks
+
+            mic_names = [name for _, name in mics] or ["Nenhum microfone encontrado"]
+            lb_names  = [name for _, name in loopbacks] or ["Nenhum loopback encontrado"]
+
+            self.after(0, lambda: self.mic_dropdown.configure(values=mic_names))
+            self.after(0, lambda: self.mic_dropdown.set(mic_names[0]))
+            self.after(0, lambda: self.speaker_dropdown.configure(values=lb_names))
+            self.after(0, lambda: self.speaker_dropdown.set(lb_names[0]))
+            self.after(0, lambda: self._log(f"Dispositivos carregados: {len(mics)} mic(s), {len(loopbacks)} loopback(s)."))
+
+        threading.Thread(target=_load, daemon=True, name="DeviceLoader").start()
+
+    def _select_dir(self) -> None:
+        """Abre o diálogo nativo de seleção de diretório e persiste em _output_dir."""
+        path = filedialog.askdirectory(title="Selecione o diretório de saída")
+        if path:
+            self._output_dir = Path(path)
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, str(self._output_dir))
+            self._log(f"Diretório configurado: {self._output_dir}")
+
+    def _toggle_record(self) -> None:
+        """
+        Alterna entre INICIAR e FINALIZAR a gravação.
+        Na INICIAR: valida campos, determina índices reais dos devices e
+        chama AudioEngine.start() — que retorna imediatamente (não bloqueia).
+        Na FINALIZAR: chama AudioEngine.stop() em thread separada para não
+        bloquear a UI enquanto as threads de captura fazem join().
+        """
+        if not self._is_recording:
+            # ── Validações pré-gravação ───────────────────────────────────
+            if not self._output_dir:
+                self._log("[ERRO] Selecione um diretório de saída antes de gravar.")
+                return
+            if not self.title_entry.get().strip():
+                self._log("[ERRO] Informe o título da reunião antes de gravar.")
+                return
+
+            mic_sel  = self.mic_dropdown.get()
+            lb_sel   = self.speaker_dropdown.get()
+            mic_idx  = next((idx for idx, name in self._mic_map if name == mic_sel), -1)
+            lb_idx   = next((idx for idx, name in self._loopback_map if name == lb_sel), -1)
+
+            self._is_recording = True
             self.record_btn.configure(
                 text="⏹  Finalizar e Transcrever",
                 fg_color="#117A65",
                 hover_color="#0E6655",
+                state="normal",
             )
-            self._log("● Gravação INICIADA... [MOCK — nenhum áudio capturado]")
+            self._audio_engine.start(mic_idx, lb_idx, self._output_dir)
+
         else:
+            # ── Encerramento ──────────────────────────────────────────────
+            self._is_recording = False
             self.record_btn.configure(
-                text="⏺  Iniciar Gravação",
-                fg_color="#C0392B",
-                hover_color="#922B21",
+                text="Aguarde...",
+                state="disabled",
             )
-            self._log("■ Gravação ENCERRADA. Iniciando transcrição... [MOCK]")
-            self._log("✔ Transcrição concluída. Arquivo salvo no diretório destino. [MOCK]")
+
+            def _stop_and_restore() -> None:
+                wav_path = self._audio_engine.stop()
+                # Restaura botão na thread principal após o stop completar
+                self.after(0, lambda: self.record_btn.configure(
+                    text="⏺  Iniciar Gravação",
+                    fg_color="#C0392B",
+                    hover_color="#922B21",
+                    state="normal",
+                ))
+                if wav_path:
+                    self.after(0, lambda: self._log(
+                        f"Áudio pronto para transcrição: {wav_path} — [Fase 3 pendente]"
+                    ))
+
+            threading.Thread(target=_stop_and_restore, daemon=True, name="StopHandler").start()

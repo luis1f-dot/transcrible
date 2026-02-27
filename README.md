@@ -36,6 +36,6 @@ src/
 | Fase | Descrição | Status |
 |------|-----------|--------|
 | 1 | Estrutura Base e UI Mock | ✅ Concluída |
-| 2 | Motor de Áudio (WASAPI) | 🔲 Pendente |
+| 2 | Motor de Áudio (WASAPI) | ✅ Concluída |
 | 3 | Integração Whisper e I/O | 🔲 Pendente |
 | 4 | Orquestração e Testes | 🔲 Pendente |
