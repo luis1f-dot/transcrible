@@ -1,0 +1,29 @@
+# .gitignore — MeetRecorder & Transcriber Local
+
+# Ambiente virtual Python
+.venv/
+venv/
+env/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Artefato de áudio temporário (nunca deve ser versionado)
+temp_meeting.wav
+
+# Outputs de transcrição gerados pelo app
+*.txt
+*.md
+!README.md
+!.agent/*.md
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
