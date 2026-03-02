@@ -1,6 +1,6 @@
 @echo off
 :: ─────────────────────────────────────────────────────────────────────────────
-:: run.bat — Launcher do MeetRecorder & Transcriber Local
+:: run.bat — Launcher do Escriba
 :: Ativa o ambiente virtual e inicia a aplicação a partir de qualquer diretório.
 :: ─────────────────────────────────────────────────────────────────────────────
 
@@ -23,6 +23,6 @@ python src\main.py
 :: Mantém o terminal aberto apenas em caso de erro (exit code != 0)
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo [ERRO] A aplicacao encerrou com codigo %ERRORLEVEL%.
+    echo [ERRO] Escriba encerrou com codigo %ERRORLEVEL%.
     pause
 )

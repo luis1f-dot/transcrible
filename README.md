@@ -1,4 +1,4 @@
-﻿# MeetRecorder & Transcriber Local
+﻿# Escriba
 
 Aplicação desktop Python para **gravação simultânea de microfone e áudio do sistema** (loopback WASAPI) com **transcrição local via Whisper** — sem nenhum dado sair da máquina.
 
@@ -6,7 +6,7 @@ Aplicação desktop Python para **gravação simultânea de microfone e áudio d
 
 ## Visão Geral
 
-O MeetRecorder captura duas fontes de áudio em paralelo:
+O Escriba captura duas fontes de áudio em paralelo:
 
 | Fonte | Tecnologia | Finalidade |
 |---|---|---|

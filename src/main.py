@@ -1,5 +1,5 @@
 # src/main.py
-# Ponto de entrada da aplicação MeetRecorder & Transcriber Local.
+# Ponto de entrada da aplicação Escriba.
 # Responsabilidade: instanciar a janela principal, configurar o logging
 # persistente em arquivo e iniciar o event loop.
 
@@ -47,7 +47,7 @@ from ui.app_window import AppWindow  # noqa: E402 (import após sys.path e loggi
 def main() -> None:
     """Inicializa e executa a aplicação."""
     logger.info("=" * 60)
-    logger.info("MeetRecorder & Transcriber Local — iniciando sessão")
+    logger.info("Escriba — iniciando sessão")
     logger.info("Log persistido em: %s", _LOG_DIR / "app.log")
     app = AppWindow()
     app.mainloop()

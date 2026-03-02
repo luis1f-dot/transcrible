@@ -1,5 +1,5 @@
 # Especificação Técnica e Plano de Implementação
-**Projeto:** MeetRecorder & Transcriber Local
+**Projeto:** Escriba
 **Versão:** 1.0.0
 **Autor:** Engenharia (Planejamento)
 

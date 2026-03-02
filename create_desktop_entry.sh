@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# create_desktop_entry.sh — Cria entry .desktop para o MeetRecorder no Linux
+# create_desktop_entry.sh — Cria entry .desktop para o Escriba no Linux
 # ─────────────────────────────────────────────────────────────────────────────
 # Uso:
 #   chmod +x create_desktop_entry.sh
@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRY_DIR="$HOME/.local/share/applications"
-ENTRY_FILE="$ENTRY_DIR/meetrecorder.desktop"
+ENTRY_FILE="$ENTRY_DIR/escriba.desktop"
 RUN_SCRIPT="$SCRIPT_DIR/run.sh"
 
 # Garante que run.sh e executavel
@@ -32,8 +32,8 @@ cat > "$ENTRY_FILE" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=MeetRecorder
-GenericName=Gravador de Reunioes
+Name=Escriba
+GenericName=Gravador e Transcritor de Reunioes
 Comment=Grava microfone + audio do sistema e transcreve via Whisper local
 Exec=bash -c 'cd "$SCRIPT_DIR" && "$RUN_SCRIPT"'
 Icon=$ICON_RESOLVED
@@ -50,5 +50,5 @@ echo ""
 echo "Entrada .desktop criada com sucesso:"
 echo "  $ENTRY_FILE"
 echo ""
-echo "O app 'MeetRecorder' deve aparecer no launcher do seu ambiente grafico."
+echo "O app 'Escriba' deve aparecer no launcher do seu ambiente grafico."
 echo "Se nao aparecer, faca logout e login novamente."

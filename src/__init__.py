@@ -1,1 +1,1 @@
-# MeetRecorder & Transcriber Local — pacote raiz
+# Escriba — pacote raiz

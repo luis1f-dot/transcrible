@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# run.sh — Launcher do MeetRecorder & Transcriber Local (Linux / macOS)
+# run.sh — Launcher do Escriba (Linux / macOS)
 # ─────────────────────────────────────────────────────────────────────────────
 # Uso:
 #   chmod +x run.sh
@@ -38,5 +38,5 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_ACTIVATE"
 
-echo "Iniciando MeetRecorder & Transcriber Local..."
+echo "Iniciando Escriba..."
 python "$SCRIPT_DIR/src/main.py"

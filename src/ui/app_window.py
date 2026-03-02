@@ -20,7 +20,7 @@ ctk.set_default_color_theme("blue")
 
 class AppWindow(ctk.CTk):
     """
-    Janela principal do MeetRecorder & Transcriber Local.
+    Janela principal do Escriba.
 
     Responsabilidade: exclusivamente renderizar a UI e capturar intenções do usuário.
     A lógica de negócio vive nos módulos audio/, transcription/ e io_manager/.
@@ -29,7 +29,7 @@ class AppWindow(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("MeetRecorder & Transcriber Local  v1.0")
+        self.title("Escriba  v1.0")
         self.geometry("700x700")
         self.resizable(False, False)
         self._is_recording: bool = False
