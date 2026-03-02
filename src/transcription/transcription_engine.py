@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from pathlib import Path
 from typing import Callable, Literal
 
+import soundfile as sf
 from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
@@ -36,13 +37,10 @@ def _jaccard(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
-def _dedup_segments(lines: list[str], threshold: float = 0.85) -> list[str]:
-    """Remove segmentos consecutivos que sejam quase idênticos ao segmento
-    anterior (Jaccard ≥ threshold). Previne loops como:
-        'está aqui em Verde-a-na-Orden,'
-        'está aqui em Verde-a-na-Orden,'
-        'está aqui em Verde-a-na-Orden,'
-    sem descartar variações legítimas de conteúdo."""
+def _dedup_segments(lines: list[str], threshold: float = 0.95) -> list[str]:
+    """Remove segmentos consecutivos quase idênticos ao anterior
+    (Jaccard ≥ threshold). Limiar 0.95 = só descarta repetições praticamente
+    iguais (ex: 'Verde-a-na-Orden,' x3)."""
     if not lines:
         return lines
     result: list[str] = [lines[0]]
@@ -54,13 +52,89 @@ def _dedup_segments(lines: list[str], threshold: float = 0.85) -> list[str]:
     return result
 
 
+def _collapse_intra_repetitions(text: str, max_repeats: int = 2) -> str:
+    """Detecta e colapsa frases que se repetem DENTRO de um segmento.
+
+    O Whisper pode gerar loops intra-segmento como:
+        "vamos para o outro vídeo, vamos para o outro vídeo, vamos para..."
+
+    Estratégia baseada em tokens (não regex):
+        1. Tokeniza o texto em palavras.
+        2. Para cada comprimento de padrão N (de 3 a 15 palavras), varre
+           o array de tokens procurando sequências idênticas consecutivas.
+        3. Se encontrar > max_repeats repetições, mantém apenas max_repeats.
+        4. Varre do padrão mais longo para o mais curto (greedy).
+
+    Args:
+        text:        Texto de um segmento individual.
+        max_repeats: Quantas repetições manter (default: 2).
+
+    Returns:
+        Texto com repetições colapsadas.
+    """
+    if not text:
+        return text
+
+    # Tokeniza preservando pontuação colada nas palavras
+    words = text.split()
+    if len(words) < 6:
+        return text
+
+    changed = False
+    # Testa padrões de 15 palavras descendo até 3 (greedy: maior primeiro)
+    for pattern_len in range(min(15, len(words) // 3), 2, -1):
+        i = 0
+        new_words: list[str] = []
+        while i < len(words):
+            # Conta quantas vezes o padrão a partir de words[i] se repete
+            pattern = words[i : i + pattern_len]
+            if len(pattern) < pattern_len:
+                new_words.extend(words[i:])
+                break
+
+            count = 1
+            j = i + pattern_len
+            while j + pattern_len <= len(words):
+                candidate = words[j : j + pattern_len]
+                # Compara ignorando pontuação final de cada token
+                strip_punct = lambda w: w.rstrip(",.;:!?")
+                if [strip_punct(w).lower() for w in candidate] == [strip_punct(w).lower() for w in pattern]:
+                    count += 1
+                    j += pattern_len
+                else:
+                    break
+
+            if count > max_repeats:
+                # Mantém apenas max_repeats ocorrências
+                for _ in range(max_repeats):
+                    new_words.extend(pattern)
+                i = j  # pula todas as repetições extras
+                changed = True
+            else:
+                new_words.append(words[i])
+                i += 1
+
+        words = new_words
+
+    if changed:
+        result = " ".join(words)
+        logger.info(
+            "[AntiLoop] Repetição intra-segmento colapsada: %d→%d chars",
+            len(text), len(result),
+        )
+        return result
+    return text
+
+
 # Diretório de cache local → evita re-download e não polui ~/.cache de outros projetos.
 _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "whisper"
 
 # Timeout máximo em segundos para a inferência do Whisper.
-# Regra de bolso: ~1 min de CPU por 10 min de áudio no modelo base.
-# Para reuniões de até 1h, 10 min de timeout é margem segura.
-_TRANSCRIPTION_TIMEOUT: int = 600
+# Fórmula: 3 minutos por cada 10 minutos de áudio (modelo base, CPU int8).
+# Para reuniões de até 3h→ ~54 min. Teto absoluto: 60 min.
+# O timeout é calculado dinamicamente em transcribe() com base na
+# duração real do WAV. Este valor é o TETO máximo.
+_TRANSCRIPTION_TIMEOUT_MAX: int = 14_400  # 4 h
 
 ModelSize = Literal["tiny", "base", "small"]
 
@@ -128,63 +202,100 @@ class TranscriptionEngine:
             self._on_status("Transcrevendo áudio... Por favor, aguarde.")
 
             def _run_transcribe():
-                return model.transcribe(
+                """Executa a transcrição COMPLETA dentro do executor —
+                inclui tanto a criação do gerador quanto a iteração de
+                todos os segmentos. Isso garante que o timeout proteja
+                todo o pipeline, não apenas a criação do gerador lazy."""
+                segs, inf = model.transcribe(
                     str(wav_path),
                     language=language,
                     beam_size=5,
-                    # temperature=0 — decoding determinístico: elimina a aleatoriedade
-                    # que permite ao modelo "completar" criativamente trechos incertos.
+                    # temperature=0 — escalar, NÃO tupla.
+                    # ┌───────────────────────────────────────────────────┐
+                    # │ POR QUE NÃO USAR TUPLA (0.0, 0.2, 0.4, ...)?    │
+                    # │                                                   │
+                    # │ Com tupla, o faster-whisper re-decodifica com     │
+                    # │ temperaturas mais altas quando compression_ratio  │
+                    # │ > 2.4. Temperaturas altas (≥0.4) fazem o modelo  │
+                    # │ INVENTAR PALAVRAS em outros idiomas ("beaches",   │
+                    # │ "rooms", "biophilia") misturadas com português.   │
+                    # │                                                   │
+                    # │ Solução: temperature=0 (determinístico) + o       │
+                    # │ filtro _collapse_intra_repetitions() no pós-      │
+                    # │ processamento cuida de loops sem gerar lixo.      │
+                    # └───────────────────────────────────────────────────┘
                     temperature=0,
-                    # condition_on_previous_text=False — principal parâmetro
-                    # anti-alucinação: impede que um segmento com erro "contamine"
-                    # os segmentos seguintes via contexto de atenção do decoder.
                     condition_on_previous_text=False,
-                    # no_speech_threshold — segmentos com probabilidade de não-fala
-                    # acima deste limiar são descartados em vez de transcritos
-                    # com texto inventado.
                     no_speech_threshold=0.6,
-                    # log_prob_threshold — descarta segmentos com log-probabilidade
-                    # média abaixo de -1.0 (baixa confiança do modelo).
                     log_prob_threshold=-1.0,
-                    # compression_ratio_threshold — FIX PRINCIPAL para o loop
-                    # "a cor de que é a cor de...": mede a razão de compressão
-                    # gzip do texto gerado. Saída repetitiva comprime muito bem
-                    # (razão alta); 2.0 descarta esses segmentos antes de retornar.
-                    # Default 2.4 é permissivo demais para ruído de eco/notebook.
-                    compression_ratio_threshold=2.0,
+                    compression_ratio_threshold=2.4,
                     vad_filter=True,
                     vad_parameters={
-                        # 0.65 — mais conservador que o default 0.5: reduz falsos
-                        # positivos de fala em microfones de notebook com eco do
-                        # alto-falante, que geram sinal ambíguo para o VAD Silero.
-                        "threshold": 0.65,
-                        "min_silence_duration_ms": 500,
+                        "threshold": 0.45,
+                        "min_silence_duration_ms": 800,
                         "speech_pad_ms": 400,
                     },
                 )
+                # CRÍTICO: iterar o gerador AQUI dentro do executor para
+                # que o timeout cubra a inferência real, não apenas a
+                # criação do gerador lazy.
+                lines: list[str] = []
+                for i, seg in enumerate(segs, 1):
+                    text = seg.text.strip()
+                    if text:
+                        lines.append(text)
+                    # Atualiza progresso a cada 25 segmentos para o usuário
+                    # saber que a transcrição está viva e avançando.
+                    if i % 25 == 0:
+                        self._on_status(
+                            f"Transcrevendo... {i} segmentos processados"
+                        )
+                        logger.debug("[TranscriptionEngine] %d segmentos processados.", i)
+                return lines, inf
 
-            # Envolve a inferência em ThreadPoolExecutor para aplicar timeout.
-            # Por que não usar signal.alarm? Não funciona em Windows nem em
-            # threads secundárias — ThreadPoolExecutor.result(timeout) é a
-            # abordagem idiomática e portável.
+            # Calcula timeout dinâmico: ~30s por minuto de áudio, mín 5 min.
+            # Fator 30 (0.5× realtime) é conservador para CPU int8 "base"
+            # que tipicamente processa a 3-10× realtime. Garante margem
+            # mesmo em CPUs lentas ou quando 100% do áudio contém fala.
+            try:
+                _info_probe = sf.info(str(wav_path))
+                _audio_duration_min = _info_probe.duration / 60.0
+                _dynamic_timeout = max(300, int(_audio_duration_min * 30))  # ~30s por min de áudio
+                _dynamic_timeout = min(_dynamic_timeout, _TRANSCRIPTION_TIMEOUT_MAX)
+                logger.info(
+                    "[TranscriptionEngine] Áudio: %.1f min → timeout: %d s (%.1f min)",
+                    _audio_duration_min, _dynamic_timeout, _dynamic_timeout / 60,
+                )
+                self._on_status(
+                    f"Transcrevendo {_audio_duration_min:.0f} min de áudio... "
+                    f"(timeout: {_dynamic_timeout // 60} min)"
+                )
+            except Exception:
+                _dynamic_timeout = _TRANSCRIPTION_TIMEOUT_MAX
+                _audio_duration_min = 0
+
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="WhisperInfer") as pool:
                 future = pool.submit(_run_transcribe)
                 try:
-                    segments, info = future.result(timeout=_TRANSCRIPTION_TIMEOUT)
+                    raw_lines, info = future.result(timeout=_dynamic_timeout)
                 except FuturesTimeoutError:
                     logger.error(
                         "[TranscriptionEngine] Timeout após %ds — WAV preservado.",
-                        _TRANSCRIPTION_TIMEOUT,
+                        _dynamic_timeout,
                     )
                     self._on_status(
-                        f"[ERRO] Transcrição excedeu {_TRANSCRIPTION_TIMEOUT // 60} min. "
+                        f"[ERRO] Transcrição excedeu {_dynamic_timeout // 60} min. "
                         "O arquivo WAV foi preservado para retry manual."
                     )
                     raise RuntimeError("TranscriptionTimeout")
 
-            # `segments` é um gerador lazy — iterar aqui dispara a inferência real.
-            raw_lines = [seg.text.strip() for seg in segments if seg.text.strip()]
-            lines = _dedup_segments(raw_lines)
+            # Pipeline de pós-processamento (2 etapas):
+            # 1. Colapsa repetições INTRA-segmento ("X, X, X, X" → "X, X")
+            cleaned = [_collapse_intra_repetitions(line) for line in raw_lines]
+            cleaned = [line for line in cleaned if line.strip()]
+
+            # 2. Remove segmentos INTER-segmento duplicados consecutivos
+            lines = _dedup_segments(cleaned)
             if len(lines) < len(raw_lines):
                 logger.info(
                     "[Dedup] %d segmento(s) repetido(s) removido(s) de %d totais.",

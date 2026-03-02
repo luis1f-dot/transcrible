@@ -95,6 +95,40 @@ def _mix(mic: np.ndarray, loopback: np.ndarray) -> np.ndarray:
     return _normalize(mixed)
 
 
+def _estimate_noise_floor(data: np.ndarray, sr: int, window_secs: float = 0.5, frame: int = 512) -> float:
+    """
+    Estima o ruído de fundo (noise floor) a partir da janela inicial do áudio.
+
+    Analisa os primeiros `window_secs` segundos usando frames de `frame` amostras
+    e retorna o percentil-75 dos valores de RMS por frame.
+
+    Usar percentil-75 em vez de média torna a estimativa robusta a rajadas de voz
+    que possam ocorrer no início da gravação — apenas o nível de fundo persistente
+    fica representado.
+
+    Args:
+        data:         Array float32 mono (já filtrado ou cru).
+        sr:           Taxa de amostragem do array (em Hz).
+        window_secs:  Duração da janela de análise (padrão: 0.5 s).
+        frame:        Tamanho do frame de RMS em amostras (padrão: 512).
+
+    Returns:
+        Noise floor estimado como float. Retorna 0.0 se o array estiver vazio.
+    """
+    if len(data) == 0:
+        return 0.0
+    n_samples = min(int(sr * window_secs), len(data))
+    window = data[:n_samples]
+    rms_values = [
+        float(np.sqrt(np.mean(window[i : i + frame] ** 2)))
+        for i in range(0, len(window), frame)
+        if len(window[i : i + frame]) > 0
+    ]
+    if not rms_values:
+        return 0.0
+    return float(np.percentile(rms_values, 75))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AudioEngine
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,21 +361,28 @@ class AudioEngine:
 
     def _preprocess_wav(self, wav_path: Path) -> None:
         """
-        Aplica filtros de pós-processamento no WAV para reduzir alucinacões
+        Aplica filtros de pós-processamento no WAV para reduzir alucinações
         do Whisper e melhorar a inteligibilidade da transcrição.
 
         Etapas:
-          1. Filtro passa-banda Butterworth 300–3400 Hz — faixa da voz humana.
-             Elimina hum elétrico (50/60 Hz), HVAC e sibilo de alta frequência
-             que não carregam informação fonética mas confundem o modelo.
-          2. Noise gate suave por frame de 512 amostras — zera frames com
-             RMS abaixo de 0.005 (patamar de silêncio percebido). Reduz
-             drasticamente alucinacões em trechos mudos, onde o Whisper
-             tende a "completar" o texto com frases inventadas.
-          3. Normalização de pico para 0.95 — garante nível de entrada
-             adequado sem clipping.
+          1. Filtro passa-banda Butterworth 80–7500 Hz:
+             - 80 Hz de corte baixo: remove hum elétrico (50/60 Hz) e vibrações
+               mecânicas sem tocar nos harmônicos fundamentais da voz (≥85 Hz).
+             - 7500 Hz de corte alto: preserva TODAS as consoantes fricativas
+               (/s/, /f/, /ʃ/) cujas frequências centrais ficam entre 4000–8000 Hz.
+               O Whisper foi treinado com áudio 16 kHz (Nyquist 8 kHz) — cortar
+               em 3400 Hz (sessões anteriores) eliminava METADE da informação
+               fonética que o modelo espera, causando erros de reconhecimento.
+          2. Noise gate ADAPTATIVO por frame de 512 amostras:
+             - Estima ruído de fundo pelos primeiros 0.5 s (percentil-75 do RMS)
+             - Limiar = max(0.008, noise_floor × 3)
+             - Piso mínimo 0.008: preserva fala suave a ~60 cm do mic (RMS ~0.01)
+               sem deixar passar silêncio puro (RMS < 0.003).
+             - Fator ×3 (era ×4): menos agressivo — mantém fala a distância
+               média enquanto zera eco de alto-falante (tipicamente < noise×2).
+          3. Normalização de pico para 0.95.
 
-        Por que na sáida do AudioEngine e não na entrada?
+        Por que na saída do AudioEngine e não na entrada?
         Processar em tempo real exigiria latência e sincronismo entre as
         3 threads. Pós-processar o WAV final é mais simples, robusto e
         não afeta o desempenho de captura.
@@ -351,37 +392,139 @@ class AudioEngine:
             return
 
         try:
-            data, sr = sf.read(str(wav_path), dtype="float32")
-            if len(data) == 0:
+            file_info = sf.info(str(wav_path))
+            total_samples = int(file_info.frames)
+            sr = file_info.samplerate
+
+            if total_samples == 0:
                 return
 
-            # 1. Filtro passa-banda 300–3400 Hz
+            # Para arquivos grandes (>30 min @ 16 kHz ≈ 28.8M amostras),
+            # processa em blocos de 5 min para limitar RAM.
+            # Isso evita carregar 1-2 GB de float32 de uma vez em
+            # reuniões de 1-4 horas.
+            _CHUNK_SAMPLES = 5 * 60 * sr  # 5 min de áudio por bloco
+            _use_chunked = total_samples > 30 * 60 * sr
+
+            duration_min = total_samples / sr / 60
+            logger.info(
+                "[Preprocess] WAV: %.1f min, %d amostras, sr=%d — modo %s",
+                duration_min, total_samples, sr,
+                "chunked" if _use_chunked else "in-memory",
+            )
+
+            # ── Coeficientes do filtro passa-banda ──
             nyq  = sr / 2.0
-            low  = 300.0 / nyq
-            high = min(3400.0 / nyq, 0.99)  # clip: instabilidade próximo ao Nyquist
+            low  = 80.0 / nyq
+            high = min(7500.0 / nyq, 0.99)
             sos  = sps.butter(4, [low, high], btype="bandpass", output="sos")
-            data = sps.sosfilt(sos, data).astype(np.float32)
 
-            # 2. Noise gate por frame (512 amostras ~ 32 ms @ 16 kHz)
-            # Limiar 0.015 (era 0.005): microfones de notebook com eco de
-            # alto-falante geram frames de ~0.005-0.01 RMS que enganam o
-            # Whisper como fala válida. 0.015 elimina esse ruído residual
-            # sem cortar voz próxima ao mic (tipicamente RMS > 0.05).
-            _GATE_THRESHOLD = 0.015
+            # ── Noise gate config ──
             _FRAME = 512
-            for i in range(0, len(data), _FRAME):
-                frame = data[i : i + _FRAME]
-                rms = float(np.sqrt(np.mean(frame ** 2)))
-                if rms < _GATE_THRESHOLD:
-                    data[i : i + _FRAME] = 0.0
+            _MIN_THRESHOLD = 0.008
 
-            # 3. Normalização de pico
-            peak = float(np.max(np.abs(data)))
-            if peak > 0:
-                data = (data / peak * 0.95).astype(np.float32)
+            if _use_chunked:
+                # === MODO CHUNKED: processa em blocos de 5 min ===
+                self._on_status(
+                    f"⟳ Pré-processando {duration_min:.0f} min de áudio em blocos..."
+                )
 
-            sf.write(str(wav_path), data, sr, subtype="PCM_16")
-            self._on_status("✔ Filtros de áudio aplicados (banda de voz + noise gate).")
+                # Passo 1: estima noise floor dos primeiros 0.5s
+                with sf.SoundFile(str(wav_path), mode="r") as reader:
+                    probe = reader.read(int(0.5 * sr), dtype="float32")
+                noise_floor = _estimate_noise_floor(probe, sr, window_secs=0.5, frame=_FRAME)
+                del probe
+                _GATE_THRESHOLD = max(_MIN_THRESHOLD, noise_floor * 3.0)
+
+                # Passo 2: processa blocos → arquivo temporário
+                tmp_path = wav_path.with_suffix(".tmp.wav")
+                peak = 0.0
+                zi = sps.sosfilt_zi(sos)  # estado do filtro entre blocos
+                # sosfilt_zi retorna shape (n_sections, 2); para 1D data é OK
+
+                with sf.SoundFile(str(wav_path), mode="r") as reader, \
+                     sf.SoundFile(str(tmp_path), mode="w", samplerate=sr,
+                                  channels=1, subtype="PCM_16") as writer:
+                    blocks_done = 0
+                    while True:
+                        chunk = reader.read(_CHUNK_SAMPLES, dtype="float32")
+                        if len(chunk) == 0:
+                            break
+
+                        # Bandpass com estado contínuo entre blocos
+                        chunk, zi = sps.sosfilt(sos, chunk, zi=zi)
+                        chunk = chunk.astype(np.float32)
+
+                        # Noise gate
+                        for i in range(0, len(chunk), _FRAME):
+                            frame = chunk[i : i + _FRAME]
+                            rms = float(np.sqrt(np.mean(frame ** 2)))
+                            if rms < _GATE_THRESHOLD:
+                                chunk[i : i + _FRAME] = 0.0
+
+                        # Track peak para normalização no passo 3
+                        chunk_peak = float(np.max(np.abs(chunk)))
+                        if chunk_peak > peak:
+                            peak = chunk_peak
+
+                        writer.write(chunk)
+                        blocks_done += 1
+                        if blocks_done % 4 == 0:  # a cada ~20 min
+                            self._on_status(
+                                f"⟳ Pré-processando... "
+                                f"{blocks_done * 5:.0f}/{duration_min:.0f} min"
+                            )
+
+                # Passo 3: normalização de pico (lê tmp, escreve final)
+                if peak > 0:
+                    scale = np.float32(0.95 / peak)
+                    with sf.SoundFile(str(tmp_path), mode="r") as reader, \
+                         sf.SoundFile(str(wav_path), mode="w", samplerate=sr,
+                                      channels=1, subtype="PCM_16") as writer:
+                        while True:
+                            chunk = reader.read(_CHUNK_SAMPLES, dtype="float32")
+                            if len(chunk) == 0:
+                                break
+                            writer.write(chunk * scale)
+                    tmp_path.unlink(missing_ok=True)
+                else:
+                    # Apenas rename se peak == 0 (silêncio total)
+                    import shutil
+                    shutil.move(str(tmp_path), str(wav_path))
+
+            else:
+                # === MODO IN-MEMORY: arquivos curtos (<30 min) ===
+                data, sr = sf.read(str(wav_path), dtype="float32")
+
+                # 1. Filtro passa-banda 80–7500 Hz
+                data = sps.sosfilt(sos, data).astype(np.float32)
+
+                # 2. Noise gate ADAPTATIVO
+                noise_floor = _estimate_noise_floor(data, sr, window_secs=0.5, frame=_FRAME)
+                _GATE_THRESHOLD = max(_MIN_THRESHOLD, noise_floor * 3.0)
+
+                for i in range(0, len(data), _FRAME):
+                    frame = data[i : i + _FRAME]
+                    rms = float(np.sqrt(np.mean(frame ** 2)))
+                    if rms < _GATE_THRESHOLD:
+                        data[i : i + _FRAME] = 0.0
+
+                # 3. Normalização de pico
+                peak = float(np.max(np.abs(data)))
+                if peak > 0:
+                    data = (data / peak * 0.95).astype(np.float32)
+
+                sf.write(str(wav_path), data, sr, subtype="PCM_16")
+
+            logger.info(
+                "[Preprocess] Noise floor estimado: %.4f → gate adaptativo: %.4f",
+                noise_floor,
+                _GATE_THRESHOLD,
+            )
+            self._on_status(
+                f"✔ Filtros de áudio aplicados "
+                f"(noise floor: {noise_floor:.4f} → gate: {_GATE_THRESHOLD:.4f})."
+            )
             logger.info("[Preprocess] WAV pós-processado com sucesso: %s", wav_path)
 
         except Exception as exc:

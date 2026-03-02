@@ -11,7 +11,7 @@ import pytest
 # Garante que src/ esteja no path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from audio.audio_engine import _normalize, _mix, _resample, _to_mono, TARGET_SR
+from audio.audio_engine import _normalize, _mix, _resample, _to_mono, _estimate_noise_floor, TARGET_SR
 
 
 # ── _normalize ────────────────────────────────────────────────────────────
@@ -113,3 +113,64 @@ def test_to_mono_already_mono_unchanged():
     mono = np.array([0.1, 0.2, 0.3], dtype=np.float32)
     result = _to_mono(mono)
     np.testing.assert_array_equal(result, mono)
+
+
+# ── _estimate_noise_floor ─────────────────────────────────────────────────
+
+def test_noise_floor_silent_signal_near_zero():
+    """Sinal de silêncio (zeros) deve retornar noise floor ≈ 0."""
+    data = np.zeros(16_000, dtype=np.float32)  # 1 s @ 16 kHz
+    floor = _estimate_noise_floor(data, sr=16_000)
+    assert floor < 1e-6
+
+
+def test_noise_floor_constant_tone_returns_rms():
+    """Sinal de amplitude constante: noise floor deve estar próximo do RMS real."""
+    amplitude = 0.02
+    data = np.full(16_000, amplitude, dtype=np.float32)
+    floor = _estimate_noise_floor(data, sr=16_000)
+    # percentil-75 de frames com RMS constante ≈ amplitude
+    assert abs(floor - amplitude) < 0.002
+
+
+def test_noise_floor_quiet_room_threshold_stays_at_floor():
+    """Sala silenciosa (noise_floor 0.002) → gate adaptativo ≤ 0.008 (piso mín)."""
+    # Simula ruído de fundo muito baixo (~0.002 RMS)
+    rng = np.random.default_rng(42)
+    data = rng.normal(0, 0.002, 16_000).astype(np.float32)
+    floor = _estimate_noise_floor(data, sr=16_000)
+    adaptive = max(0.008, floor * 3.0)
+    assert adaptive == 0.008, f"Esperava 0.008, obteve {adaptive:.4f}"
+
+
+def test_noise_floor_echo_room_threshold_above_floor():
+    """Com eco de alto-falante (noise_floor ~0.025) → gate adaptativo > 0.008."""
+    # Simula eco moderado de reunião (~0.025 RMS nos primeiros 0.5 s)
+    rng = np.random.default_rng(7)
+    data = rng.normal(0, 0.025, 16_000).astype(np.float32)
+    floor = _estimate_noise_floor(data, sr=16_000)
+    adaptive = max(0.008, floor * 3.0)
+    # Deve ser consideravelmente acima do piso mínimo
+    assert adaptive > 0.05, f"Gate deveria subir para > 0.05 com eco, obteve {adaptive:.4f}"
+
+
+def test_noise_floor_ignores_isolated_speech_burst():
+    """Rajada de voz pontual nos primeiros 0.5 s não deve inflar o noise floor.
+
+    O percentil-75 garante que frames de silêncio não sejam "contaminados"
+    por um único pico de voz breve na janela de análise.
+    """
+    rng = np.random.default_rng(99)
+    # 0.5 s maioritariamente silencioso (RMS ~0.002)
+    data = rng.normal(0, 0.002, 8_000).astype(np.float32)
+    # Injeta 64 ms de voz alta no meio (RMS ~0.3)
+    data[2000:3024] = rng.normal(0, 0.3, 1024).astype(np.float32)
+    floor = _estimate_noise_floor(data, sr=16_000, window_secs=0.5)
+    # O percentil-75 deve representar o fundo silencioso, não a rajada
+    assert floor < 0.05, f"Noise floor inflado indevidamente: {floor:.4f}"
+
+
+def test_noise_floor_empty_array_returns_zero():
+    """Array vazio não deve lançar exceção — retorna 0.0."""
+    floor = _estimate_noise_floor(np.array([], dtype=np.float32), sr=16_000)
+    assert floor == 0.0
