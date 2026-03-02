@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Callable, Literal
@@ -14,6 +16,43 @@ from typing import Callable, Literal
 from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
+
+
+def _normalise(text: str) -> str:
+    """Normaliza texto para comparação de similaridade: minúsculas, sem
+    acentos, sem pontuação, espaços colapsados."""
+    nfkd = unicodedata.normalize("NFKD", text.lower())
+    ascii_only = nfkd.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9 ]", "", ascii_only).strip()
+
+
+def _jaccard(a: str, b: str) -> float:
+    """Similaridade de Jaccard entre conjuntos de tokens."""
+    ta, tb = set(_normalise(a).split()), set(_normalise(b).split())
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _dedup_segments(lines: list[str], threshold: float = 0.85) -> list[str]:
+    """Remove segmentos consecutivos que sejam quase idênticos ao segmento
+    anterior (Jaccard ≥ threshold). Previne loops como:
+        'está aqui em Verde-a-na-Orden,'
+        'está aqui em Verde-a-na-Orden,'
+        'está aqui em Verde-a-na-Orden,'
+    sem descartar variações legítimas de conteúdo."""
+    if not lines:
+        return lines
+    result: list[str] = [lines[0]]
+    for line in lines[1:]:
+        if _jaccard(line, result[-1]) < threshold:
+            result.append(line)
+        else:
+            logger.debug("[Dedup] Segmento duplicado descartado: %r", line[:60])
+    return result
+
 
 # Diretório de cache local → evita re-download e não polui ~/.cache de outros projetos.
 _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "whisper"
@@ -144,7 +183,14 @@ class TranscriptionEngine:
                     raise RuntimeError("TranscriptionTimeout")
 
             # `segments` é um gerador lazy — iterar aqui dispara a inferência real.
-            lines = [seg.text.strip() for seg in segments if seg.text.strip()]
+            raw_lines = [seg.text.strip() for seg in segments if seg.text.strip()]
+            lines = _dedup_segments(raw_lines)
+            if len(lines) < len(raw_lines):
+                logger.info(
+                    "[Dedup] %d segmento(s) repetido(s) removido(s) de %d totais.",
+                    len(raw_lines) - len(lines),
+                    len(raw_lines),
+                )
             transcription = "\n".join(lines)
 
             duration_min = int(info.duration // 60)
