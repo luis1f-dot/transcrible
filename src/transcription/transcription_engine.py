@@ -101,15 +101,24 @@ class TranscriptionEngine:
                     # os segmentos seguintes via contexto de atenção do decoder.
                     condition_on_previous_text=False,
                     # no_speech_threshold — segmentos com probabilidade de não-fala
-                    # acima deste limiar são descartados em vez de transcriados
+                    # acima deste limiar são descartados em vez de transcritos
                     # com texto inventado.
                     no_speech_threshold=0.6,
                     # log_prob_threshold — descarta segmentos com log-probabilidade
                     # média abaixo de -1.0 (baixa confiança do modelo).
                     log_prob_threshold=-1.0,
+                    # compression_ratio_threshold — FIX PRINCIPAL para o loop
+                    # "a cor de que é a cor de...": mede a razão de compressão
+                    # gzip do texto gerado. Saída repetitiva comprime muito bem
+                    # (razão alta); 2.0 descarta esses segmentos antes de retornar.
+                    # Default 2.4 é permissivo demais para ruído de eco/notebook.
+                    compression_ratio_threshold=2.0,
                     vad_filter=True,
                     vad_parameters={
-                        "threshold": 0.5,              # sensibilidade do VAD Silero
+                        # 0.65 — mais conservador que o default 0.5: reduz falsos
+                        # positivos de fala em microfones de notebook com eco do
+                        # alto-falante, que geram sinal ambíguo para o VAD Silero.
+                        "threshold": 0.65,
                         "min_silence_duration_ms": 500,
                         "speech_pad_ms": 400,
                     },

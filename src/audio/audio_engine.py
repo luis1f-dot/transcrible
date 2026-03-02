@@ -363,7 +363,11 @@ class AudioEngine:
             data = sps.sosfilt(sos, data).astype(np.float32)
 
             # 2. Noise gate por frame (512 amostras ~ 32 ms @ 16 kHz)
-            _GATE_THRESHOLD = 0.005
+            # Limiar 0.015 (era 0.005): microfones de notebook com eco de
+            # alto-falante geram frames de ~0.005-0.01 RMS que enganam o
+            # Whisper como fala válida. 0.015 elimina esse ruído residual
+            # sem cortar voz próxima ao mic (tipicamente RMS > 0.05).
+            _GATE_THRESHOLD = 0.015
             _FRAME = 512
             for i in range(0, len(data), _FRAME):
                 frame = data[i : i + _FRAME]
