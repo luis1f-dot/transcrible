@@ -30,7 +30,7 @@ class AppWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("MeetRecorder & Transcriber Local  v1.0")
-        self.geometry("700x640")
+        self.geometry("700x700")
         self.resizable(False, False)
         self._is_recording: bool = False
         self._output_dir: Path | None = None
@@ -46,6 +46,7 @@ class AppWindow(ctk.CTk):
         self._loopback_map: list[tuple[int, str]] = []
 
         self._build_layout()
+        self._bind_shortcuts()
         # Popula dropdowns após o layout estar pronto
         self._populate_devices()
 
@@ -153,17 +154,31 @@ class AppWindow(ctk.CTk):
         self._log("Sistema pronto. Configure os dispositivos e inicie a gravação.")
 
     def _build_record_buttons(self) -> None:
-        """Bloco 4 — Dois botões independentes: Iniciar Gravação e Parar Gravação.
+        """Bloco 4 — Dois botões independentes + linha de atalho de teclado.
 
         Por que dois botões em vez de um toggle?
         Estados independentes eliminam qualquer ambiguidade de transição:
         btn_start só está ativo quando não se está gravando, e btn_stop
         só está ativo durante a gravação. Impossível clicar o errado.
+
+        Por que corner_radius=10 em vez de fg_color='transparent'?
+        CTkFrame transparente não propõe dimensões mínimas ao seu grid,
+        causando colapso das colunas internas em certas versões do CTk.
+        Um frame com corner_radius garante caixa delimitadora definida.
         """
-        frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="ew")
+        frame = ctk.CTkFrame(self, corner_radius=10)
+        frame.grid(row=4, column=0, padx=20, pady=(4, 20), sticky="ew")
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_columnconfigure(1, weight=1)
+
+        # Linha de dica de atalho
+        ctk.CTkLabel(
+            frame,
+            text="Atalhos: Ctrl+R — Iniciar    ·    Ctrl+P — Parar",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray55", "gray50"),
+            anchor="center",
+        ).grid(row=0, column=0, columnspan=2, padx=15, pady=(10, 4), sticky="ew")
 
         self.btn_start = ctk.CTkButton(
             frame,
@@ -174,7 +189,7 @@ class AppWindow(ctk.CTk):
             hover_color="#922B21",
             command=self._start_recording,
         )
-        self.btn_start.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.btn_start.grid(row=1, column=0, padx=(12, 6), pady=(0, 12), sticky="ew")
 
         self.btn_stop = ctk.CTkButton(
             frame,
@@ -186,7 +201,23 @@ class AppWindow(ctk.CTk):
             state="disabled",
             command=self._stop_recording,
         )
-        self.btn_stop.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+        self.btn_stop.grid(row=1, column=1, padx=(6, 12), pady=(0, 12), sticky="ew")
+
+    def _bind_shortcuts(self) -> None:
+        """
+        Vincula atalhos de teclado globais à janela principal.
+
+        Ctrl+R — Iniciar Gravação (de 'Recordar')
+        Ctrl+P — Parar Gravação
+
+        Por que bind na janela raíz e não nos botões?
+        Bind na janela captura o evento independente de qual widget
+        está com foco, tornando o atalho verdadeiramente global dentro
+        da aplicação. Os métodos já possuem guards de estado internos
+        (_is_recording), portanto não há risco de disparo duplo.
+        """
+        self.bind("<Control-r>", lambda _: self._start_recording())
+        self.bind("<Control-p>", lambda _: self._stop_recording())
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers e Callbacks reais

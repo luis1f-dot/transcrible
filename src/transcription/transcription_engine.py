@@ -92,9 +92,24 @@ class TranscriptionEngine:
                 return model.transcribe(
                     str(wav_path),
                     language=language,
-                    beam_size=5,           # beam_size=1 é greedy (mais rápido, menos preciso)
-                    vad_filter=True,       # remove silêncios longos antes da inferência
+                    beam_size=5,
+                    # temperature=0 — decoding determinístico: elimina a aleatoriedade
+                    # que permite ao modelo "completar" criativamente trechos incertos.
+                    temperature=0,
+                    # condition_on_previous_text=False — principal parâmetro
+                    # anti-alucinação: impede que um segmento com erro "contamine"
+                    # os segmentos seguintes via contexto de atenção do decoder.
+                    condition_on_previous_text=False,
+                    # no_speech_threshold — segmentos com probabilidade de não-fala
+                    # acima deste limiar são descartados em vez de transcriados
+                    # com texto inventado.
+                    no_speech_threshold=0.6,
+                    # log_prob_threshold — descarta segmentos com log-probabilidade
+                    # média abaixo de -1.0 (baixa confiança do modelo).
+                    log_prob_threshold=-1.0,
+                    vad_filter=True,
                     vad_parameters={
+                        "threshold": 0.5,              # sensibilidade do VAD Silero
                         "min_silence_duration_ms": 500,
                         "speech_pad_ms": 400,
                     },

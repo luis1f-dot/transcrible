@@ -20,7 +20,12 @@ As duas streams são misturadas, reamostradas para 16 kHz mono e salvas em WAV t
 ## Pré-requisitos
 
 ### Sistema Operacional
-- **Windows 10 ou 11** (obrigatório — a captura de loopback depende da API WASAPI exclusiva do Windows)
+
+| Plataforma | Suporte | Observação |
+|---|---|---|
+| **Windows 10 / 11** | ✅ Completo | Microfone + Loopback WASAPI |
+| **Linux** (Ubuntu, Fedora, Arch…) | ⚠️ Parcial | Apenas microfone; loopback requer sink virtual PulseAudio/PipeWire |
+| macOS | ❌ Não testado | WASAPI inexistente; loopback indisponível |
 
 ### Python
 - **Python 3.10 ou superior** (testado com 3.13)
@@ -38,6 +43,8 @@ As duas streams são misturadas, reamostradas para 16 kHz mono e salvas em WAV t
 
 ## Instalação
 
+### Windows
+
 ```bash
 # 1. Clone ou extraia o projeto
 cd caminho\para\transclible
@@ -52,7 +59,24 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-> **Nota:** a primeira instalação baixa os pesos do modelo Whisper (~150 MB para `base`) e os armazena em `.cache\whisper\` dentro do projeto. Este download ocorre uma única vez.
+### Linux
+
+```bash
+# 1. Instale dependências do sistema (Ubuntu/Debian)
+sudo apt install python3 python3-venv python3-dev portaudio19-dev libsndfile1
+
+# 2. Clone ou extraia o projeto
+cd caminho/para/transclible
+
+# 3. Crie e ative o ambiente virtual
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 4. Instale as dependências Python
+pip install -r requirements.txt
+```
+
+> **Nota:** a primeira inicialização baixa os pesos do modelo Whisper (~150 MB para `base`) e os armazena em `.cache/whisper/` dentro do projeto — download único.
 
 ---
 
@@ -60,10 +84,43 @@ pip install -r requirements.txt
 
 ### Iniciar a Aplicação
 
+#### Windows — duplo clique
+Na raiz do projeto clique duas vezes em **`run.bat`**.
+
+Ou, para criar um atalho permanente na Área de Trabalho:
+```powershell
+powershell -ExecutionPolicy Bypass -File create_shortcut.ps1
+```
+
+#### Linux — script shell
 ```bash
+chmod +x run.sh
+./run.sh
+```
+
+Para criar uma entrada no launcher gráfico (GNOME, KDE, XFCE…):
+```bash
+chmod +x create_desktop_entry.sh
+./create_desktop_entry.sh
+```
+
+#### Manual (qualquer plataforma)
+```bash
+# Windows
 .venv\Scripts\activate
 python src\main.py
+
+# Linux
+source .venv/bin/activate
+python src/main.py
 ```
+
+### Atalhos de Teclado na Interface
+
+| Atalho | Ação |
+|---|---|
+| `Ctrl + R` | Iniciar Gravação |
+| `Ctrl + P` | Parar Gravação |
 
 ### Passo a Passo na Interface
 
@@ -106,6 +163,10 @@ transclible/
 │   ├── test_audio_engine.py           # 12 testes unitários
 │   └── test_io_manager.py             # 11 testes unitários
 ├── assets/                            # Ícones e recursos visuais
+├── run.bat                            # Launcher Windows (duplo clique)
+├── run.sh                             # Launcher Linux/macOS
+├── create_shortcut.ps1                # Cria atalho na Área de Trabalho (Windows)
+├── create_desktop_entry.sh            # Cria entry .desktop no launcher (Linux)
 ├── .logs/                             # Logs rotativos (app.log, 5 MB × 3)
 ├── .cache/whisper/                    # Cache local dos pesos do modelo
 ├── requirements.txt
@@ -117,7 +178,12 @@ transclible/
 ## Executar os Testes
 
 ```bash
+# Windows
 .venv\Scripts\activate
+python -m pytest tests/ -v
+
+# Linux
+source .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
@@ -138,7 +204,7 @@ A aplicação grava logs rotativos em `.logs\app.log`:
 
 | Limitação | Detalhe |
 |---|---|
-| Apenas Windows | WASAPI Loopback não existe em macOS/Linux |
+| Loopback apenas no Windows | WASAPI Loopback não existe em macOS/Linux nativamente. No Linux é possível usar sink virtual PulseAudio/PipeWire (ver Troubleshooting) |
 | Memória durante transcrição | Modelo `small` requer ~1 GB RAM; em máquinas com menos de 4 GB, prefira `tiny` |
 | Timeout de 10 minutos | Gravações muito longas com modelo `small` podem atingir o limite; use `tiny` ou `base` |
 | Idioma fixo em PT-BR | `language="pt"` está fixo no código; reuniões em outros idiomas terão qualidade reduzida |
@@ -150,8 +216,21 @@ A aplicação grava logs rotativos em `.logs\app.log`:
 
 ### O dropdown de Loopback está vazio
 O driver de áudio não expõe dispositivo WASAPI Loopback. Soluções:
+
+**Windows:**
 1. Vá em **Painel de Som → Gravação** e ative a opção *"Stereo Mix"* ou *"O que você ouve"*.
 2. Instale o [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) como dispositivo de loopback virtual.
+
+**Linux (PulseAudio):**
+```bash
+pactl load-module module-null-sink sink_name=loopback sink_properties=device.description=Loopback
+pactl load-module module-loopback sink=loopback
+```
+
+**Linux (PipeWire / pw-loopback):**
+```bash
+pw-loopback --capture-props='media.class=Audio/Sink' &
+```
 
 ### A gravação para sozinha
 O watchdog detectou 3 erros consecutivos no microfone. Verifique:
