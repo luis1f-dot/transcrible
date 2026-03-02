@@ -22,6 +22,14 @@ try:
 except ImportError:
     _SCIPY_AVAILABLE = False
 
+try:
+    import pyaudiowpatch as pa
+    _PAWP_AVAILABLE = True
+except Exception:
+    # pyaudiowpatch pode falhar ao importar em ambientes sem WASAPI (ex: CI/Linux).
+    # Fallback: heurística por nome no list_devices().
+    _PAWP_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Taxa exigida pelo Whisper — todas as capturas são convertidas para cá.
@@ -117,36 +125,73 @@ class AudioEngine:
 
     def list_devices(self) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
         """
-        Varre os devices via sounddevice e separa microfones de loopbacks WASAPI.
+        Enumera microfones e loopbacks WASAPI disponíveis no sistema.
+
+        Estratégia de detecção de loopbacks (duas camadas):
+          1. pyaudiowpatch.get_loopback_device_info_generator() — API dedicada ao
+             Windows WASAPI loopback, mais confiável que inferir pelo nome do device.
+          2. Fallback: heurística por nome ("loopback" + flag is_loopback) dentro
+             do host API WASAPI, preservado para ambientes sem pyaudiowpatch.
+
+        Microfones: todos os host APIs (MME, DirectSound, WASAPI) são incluídos,
+        garantindo que qualquer entrada reconhecida pelo sistema apareça no dropdown.
 
         Retorna:
             mics      — lista de (device_index, nome_display) com max_input_channels > 0
-            loopbacks — lista de (device_index, nome_display) que são WASAPI loopback
+            loopbacks — lista de (device_index, nome_display) identificados como loopback
         """
         mics: list[tuple[int, str]] = []
         loopbacks: list[tuple[int, str]] = []
+        loopback_names: set[str] = set()  # nomes usados para cruzar com sounddevice
 
         try:
             devices = sd.query_devices()
             hostapis = sd.query_hostapis()
 
-            for idx, dev in enumerate(devices):
-                hostapi_name = hostapis[dev["hostapi"]]["name"].upper()
-                name = dev["name"]
+            # ── Camada 1: pyaudiowpatch (método nativo Windows, mais confiável) ───────
+            if _PAWP_AVAILABLE:
+                try:
+                    _pa = pa.PyAudio()
+                    for lb_info in _pa.get_loopback_device_info_generator():
+                        loopback_names.add(lb_info["name"])
+                        logger.info(
+                            "[Devices] Loopback detectado (pyaudiowpatch): %s",
+                            lb_info["name"],
+                        )
+                    _pa.terminate()
+                except Exception as exc:
+                    logger.warning(
+                        "[Devices] pyaudiowpatch falhou ao enumerar loopbacks: %s — usando fallback.",
+                        exc,
+                    )
 
-                if dev["max_input_channels"] > 0:
-                    # Loopback WASAPI: device de input com "loopback" no nome
-                    # ou que seja WASAPI e cujo device "pai" seja de output.
-                    if "WASAPI" in hostapi_name and (
-                        "loopback" in name.lower()
-                        or dev.get("is_loopback", False)
-                    ):
-                        loopbacks.append((idx, f"[Loopback] {name}"))
-                    else:
-                        mics.append((idx, name))
+            # ── Classifica cada device sounddevice ───────────────────────────────
+            for idx, dev in enumerate(devices):
+                if dev["max_input_channels"] <= 0:
+                    continue
+
+                name = dev["name"]
+                hostapi_name = hostapis[dev["hostapi"]]["name"].upper()
+
+                # Camada 2 (fallback): heurística por nome se pyaudiowpatch não
+                # retornou nada — aplica apenas dentro do host API WASAPI.
+                is_loopback_fallback = (
+                    not loopback_names
+                    and "WASAPI" in hostapi_name
+                    and ("loopback" in name.lower() or dev.get("is_loopback", False))
+                )
+
+                if name in loopback_names or is_loopback_fallback:
+                    loopbacks.append((idx, f"[Loopback] {name}"))
+                    logger.info("[Devices] Loopback (sd idx=%d): %s", idx, name)
+                else:
+                    mics.append((idx, name))
+                    logger.info("[Devices] Microfone (sd idx=%d, hostapi=%s): %s", idx, hostapi_name, name)
 
             if not loopbacks:
                 loopbacks.append((-1, "[Aviso] Nenhum loopback WASAPI encontrado"))
+            if not mics:
+                mics.append((-1, "[Aviso] Nenhum microfone encontrado"))
 
         except Exception as exc:
             logger.error("Erro ao listar devices: %s", exc)
@@ -154,6 +199,7 @@ class AudioEngine:
             mics = [(-1, "[Erro] Dispositivos indisponíveis")]
             loopbacks = [(-1, "[Erro] Loopback indisponível")]
 
+        logger.info("[Devices] Total encontrado: %d mic(s), %d loopback(s).", len(mics), len(loopbacks))
         return mics, loopbacks
 
     def start(

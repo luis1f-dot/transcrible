@@ -60,7 +60,7 @@ class AppWindow(ctk.CTk):
         self._build_device_block()
         self._build_meeting_block()
         self._build_console_block()
-        self._build_record_button()
+        self._build_record_buttons()
 
     def _build_device_block(self) -> None:
         """Bloco 1 — Dropdowns de Microfone e Alto-falante."""
@@ -152,18 +152,41 @@ class AppWindow(ctk.CTk):
         self.console.grid(row=3, column=0, padx=20, pady=(0, 8), sticky="ew")
         self._log("Sistema pronto. Configure os dispositivos e inicie a gravação.")
 
-    def _build_record_button(self) -> None:
-        """Bloco 4 — Botão principal de toggle Gravar / Finalizar."""
-        self.record_btn = ctk.CTkButton(
-            self,
+    def _build_record_buttons(self) -> None:
+        """Bloco 4 — Dois botões independentes: Iniciar Gravação e Parar Gravação.
+
+        Por que dois botões em vez de um toggle?
+        Estados independentes eliminam qualquer ambiguidade de transição:
+        btn_start só está ativo quando não se está gravando, e btn_stop
+        só está ativo durante a gravação. Impossível clicar o errado.
+        """
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+
+        self.btn_start = ctk.CTkButton(
+            frame,
             text="⏺  Iniciar Gravação",
             height=52,
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=ctk.CTkFont(size=15, weight="bold"),
             fg_color="#C0392B",
             hover_color="#922B21",
-            command=self._toggle_record,
+            command=self._start_recording,
         )
-        self.record_btn.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="ew")
+        self.btn_start.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        self.btn_stop = ctk.CTkButton(
+            frame,
+            text="⏹  Parar Gravação",
+            height=52,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#117A65",
+            hover_color="#0E6655",
+            state="disabled",
+            command=self._stop_recording,
+        )
+        self.btn_stop.grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers e Callbacks reais
@@ -224,117 +247,118 @@ class AppWindow(ctk.CTk):
             self.dir_entry.insert(0, str(self._output_dir))
             self._log(f"Diretório configurado: {self._output_dir}")
 
-    def _toggle_record(self) -> None:
+    def _start_recording(self) -> None:
         """
-        Alterna entre INICIAR e FINALIZAR a gravação.
-        Na INICIAR: valida campos, determina índices reais dos devices e
-        chama AudioEngine.start() — que retorna imediatamente (não bloqueia).
-        Na FINALIZAR: chama AudioEngine.stop() em thread separada para não
-        bloquear a UI enquanto as threads de captura fazem join().
+        Inicia a gravação após validar campos obrigatórios.
+
+        Desabilita btn_start e habilita btn_stop para garantir que os dois
+        controles nunca fiquem num estado ambíguo.
+        Chama AudioEngine.start() que retorna imediatamente (não bloqueia a UI).
+        """
+        # ── Validações pré-gravação ───────────────────────────────────────
+        if not self._output_dir:
+            self._log("[ERRO] Selecione um diretório de saída antes de gravar.")
+            return
+        if not self.title_entry.get().strip():
+            self._log("[ERRO] Informe o título da reunião antes de gravar.")
+            return
+
+        mic_sel = self.mic_dropdown.get()
+        lb_sel  = self.speaker_dropdown.get()
+        mic_idx = next((idx for idx, name in self._mic_map if name == mic_sel), -1)
+        lb_idx  = next((idx for idx, name in self._loopback_map if name == lb_sel), -1)
+
+        self._is_recording = True
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+
+        self._audio_engine.start(mic_idx, lb_idx, self._output_dir)
+        # Inicia polling para detectar encerramento automático (watchdog de hardware)
+        self.after(1000, self._poll_watchdog)
+
+    def _stop_recording(self) -> None:
+        """
+        Inicia o pipeline de encerramento: desabilita ambos os botões,
+        lança StopHandler em background e reabilita btn_start ao final.
+
+        Guard duplo com `_is_recording` evita que o watchdog e um clique
+        manual simultâneo disparem dois pipelines concorrentes.
         """
         if not self._is_recording:
-            # ── Validações pré-gravação ───────────────────────────────────
-            if not self._output_dir:
-                self._log("[ERRO] Selecione um diretório de saída antes de gravar.")
+            return  # guard — impede pipeline duplicado
+
+        self._is_recording = False
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="disabled", text="Aguarde...")
+
+        # Captura da thread principal antes de entrar na worker thread.
+        meeting_title = self.title_entry.get().strip() or "reuniao"
+        output_dir    = self._output_dir
+        model_size    = self.model_dropdown.get()           # "tiny" / "base" / "small"
+        fmt           = self.fmt_dropdown.get().lstrip(".") # "txt" ou "md"
+
+        def _stop_and_restore() -> None:
+            """
+            Orquestrador completo do pipeline pós-gravação.
+            Sequência: AudioEngine.stop() → TranscriptionEngine.transcribe()
+                       → IOManager.save() → IOManager.cleanup()
+            Cada etapa só inicia se a anterior foi bem-sucedida.
+            Roda inteiramente fora da thread principal para nunca bloquear a UI.
+            """
+            # ── Etapa 1: encerra captura de áudio ─────────────────────────
+            wav_path = self._audio_engine.stop()
+
+            def _restore_btn() -> None:
+                self.btn_start.configure(state="normal")
+                self.btn_stop.configure(state="disabled", text="⏹  Parar Gravação")
+
+            self.after(0, _restore_btn)
+
+            if not wav_path:
+                self.after(0, lambda: self._log("[ERRO] WAV não foi gerado — abortando transcrição."))
                 return
-            if not self.title_entry.get().strip():
-                self._log("[ERRO] Informe o título da reunião antes de gravar.")
+
+            # ── Etapa 2: transcrição ──────────────────────────────────────
+            try:
+                transcription = self._transcription_engine.transcribe(
+                    wav_path, model_size=model_size
+                )
+            except Exception:
+                # Erro já logado pelo TranscriptionEngine via _on_status.
+                # WAV não é deletado — usuário pode tentar transcrever manualmente.
+                self.after(0, lambda: self._log(
+                    f"[INFO] WAV preservado em: {wav_path} — é possível retry manual."
+                ))
                 return
 
-            mic_sel  = self.mic_dropdown.get()
-            lb_sel   = self.speaker_dropdown.get()
-            mic_idx  = next((idx for idx, name in self._mic_map if name == mic_sel), -1)
-            lb_idx   = next((idx for idx, name in self._loopback_map if name == lb_sel), -1)
+            # ── Etapa 3: validar dir + salvar documento ───────────────────
+            if not output_dir.exists():
+                self.after(0, lambda: self._log(
+                    f"[ERRO] Diretório de saída não existe mais: {output_dir}"
+                ))
+                self.after(0, lambda: self._log(
+                    f"[INFO] WAV preservado em: {wav_path} — salve o arquivo manualmente."
+                ))
+                return  # WAV não é deletado
+            try:
+                self._io_manager.save(
+                    title=meeting_title,
+                    transcription=transcription,
+                    output_dir=output_dir,
+                    fmt=fmt,
+                )
+            except Exception:
+                # Erro já logado pelo IOManager via _on_status
+                return
 
-            self._is_recording = True
-            self.record_btn.configure(
-                text="⏹  Finalizar e Transcrever",
-                fg_color="#117A65",
-                hover_color="#0E6655",
-                state="normal",
-            )
-            self._audio_engine.start(mic_idx, lb_idx, self._output_dir)
-            # Inicia polling para detectar encerramento automático (watchdog)
-            self.after(1000, self._poll_watchdog)
-            # Encerramento manual
-            self._is_recording = False
-            self.record_btn.configure(
-                text="Aguarde...",
-                state="disabled",
-            )
+            # ── Etapa 4: exibir transcrição na UI + GC ────────────────────
+            _text = transcription  # cópia local — evita closure binding tardio
+            self.after(0, lambda: self._show_transcription(_text))
 
-            # Captura o título agora (na thread principal) antes de entrar na worker thread.
-            meeting_title = self.title_entry.get().strip() or "reuniao"
-            output_dir    = self._output_dir
-            model_size    = self.model_dropdown.get()               # "tiny" / "base" / "small"
-            fmt           = self.fmt_dropdown.get().lstrip(".")     # "txt" ou "md"
+            # GC só após confirmar que o documento foi escrito com sucesso
+            self._io_manager.cleanup(wav_path)
 
-            def _stop_and_restore() -> None:
-                """
-                Orquestrador completo do pipeline pós-gravação.
-                Sequência: AudioEngine.stop() → TranscriptionEngine.transcribe()
-                           → IOManager.save() → IOManager.cleanup()
-                Cada etapa só inicia se a anterior foi bem-sucedida.
-                Roda inteiramente fora da thread principal para nunca bloquear a UI.
-                """
-                # ── Etapa 1: encerra captura de áudio ─────────────────────
-                wav_path = self._audio_engine.stop()
-
-                def _restore_btn() -> None:
-                    self.record_btn.configure(
-                        text="⏺  Iniciar Gravação",
-                        fg_color="#C0392B",
-                        hover_color="#922B21",
-                        state="normal",
-                    )
-                self.after(0, _restore_btn)
-
-                if not wav_path:
-                    self.after(0, lambda: self._log("[ERRO] WAV não foi gerado — abortando transcrição."))
-                    return
-
-                # ── Etapa 2: transcrição ──────────────────────────────────
-                try:
-                    transcription = self._transcription_engine.transcribe(
-                        wav_path, model_size=model_size
-                    )
-                except Exception:
-                    # Erro já logado pelo TranscriptionEngine via _on_status.
-                    # WAV não é deletado — usuário pode tentar transcrever manualmente.
-                    self.after(0, lambda: self._log(
-                        f"[INFO] WAV preservado em: {wav_path} — é possível retry manual."
-                    ))
-                    return
-
-                # ── Etapa 3: validar dir + salvar documento ──────────────────
-                if not output_dir.exists():
-                    self.after(0, lambda: self._log(
-                        f"[ERRO] Diretório de saída não existe mais: {output_dir}"
-                    ))
-                    self.after(0, lambda: self._log(
-                        f"[INFO] WAV preservado em: {wav_path} — salve o arquivo manualmente."
-                    ))
-                    return  # WAV não é deletado
-                try:
-                    file_path = self._io_manager.save(
-                        title=meeting_title,
-                        transcription=transcription,
-                        output_dir=output_dir,
-                        fmt=fmt,
-                    )
-                except Exception:
-                    # Erro já logado pelo IOManager via _on_status
-                    return
-
-                # ── Etapa 4: exibir transcrição na UI + GC ────────────────
-                # Copia local para evitar closure binding tardio
-                _text = transcription
-                self.after(0, lambda: self._show_transcription(_text))
-
-                # GC só após confirmar que o .txt foi escrito com sucesso
-                self._io_manager.cleanup(wav_path)
-
-            threading.Thread(target=_stop_and_restore, daemon=True, name="StopHandler").start()
+        threading.Thread(target=_stop_and_restore, daemon=True, name="StopHandler").start()
     def _poll_watchdog(self) -> None:
         """
         Verifica a cada 1s se o AudioEngine encerrou por watchdog (hardware fault).
@@ -347,7 +371,7 @@ class AppWindow(ctk.CTk):
 
         if self._audio_engine._stop_event.is_set():
             self._log("[AUTO] Watchdog detectou encerramento do hardware — iniciando pipeline...")
-            self._toggle_record()  # aciona o fluxo de encerramento completo
+            self._stop_recording()  # aciona o fluxo de encerramento completo
         else:
             self.after(1000, self._poll_watchdog)  # reagenda para daqui 1s
 
