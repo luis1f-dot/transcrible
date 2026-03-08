@@ -120,10 +120,12 @@ class AppWindow(ctk.CTk):
         ctk.CTkLabel(frame, text="Modelo Whisper:").grid(
             row=2, column=2, padx=(0, 6), pady=6, sticky="w"
         )
+        # SESSÃO 08: tiny removido (fraco para PT-BR + overlap), medium adicionado.
+        # small é o padrão — melhor trade-off precisão/velocidade para reuniões.
         self.model_dropdown = ctk.CTkOptionMenu(
-            frame, values=["tiny", "base", "small"], width=100
+            frame, values=["base", "small", "medium"], width=100
         )
-        self.model_dropdown.set("base")
+        self.model_dropdown.set("small")
         self.model_dropdown.grid(row=2, column=3, padx=(0, 15), pady=6, sticky="w")
 
         # Linha 3: Diretório de Saída

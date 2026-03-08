@@ -361,31 +361,28 @@ class AudioEngine:
 
     def _preprocess_wav(self, wav_path: Path) -> None:
         """
-        Aplica filtros de pós-processamento no WAV para reduzir alucinações
-        do Whisper e melhorar a inteligibilidade da transcrição.
+        Aplica filtros conservadores de pós-processamento no WAV.
 
-        Etapas:
-          1. Filtro passa-banda Butterworth 80–7500 Hz:
-             - 80 Hz de corte baixo: remove hum elétrico (50/60 Hz) e vibrações
-               mecânicas sem tocar nos harmônicos fundamentais da voz (≥85 Hz).
-             - 7500 Hz de corte alto: preserva TODAS as consoantes fricativas
-               (/s/, /f/, /ʃ/) cujas frequências centrais ficam entre 4000–8000 Hz.
-               O Whisper foi treinado com áudio 16 kHz (Nyquist 8 kHz) — cortar
-               em 3400 Hz (sessões anteriores) eliminava METADE da informação
-               fonética que o modelo espera, causando erros de reconhecimento.
-          2. Noise gate ADAPTATIVO por frame de 512 amostras:
-             - Estima ruído de fundo pelos primeiros 0.5 s (percentil-75 do RMS)
-             - Limiar = max(0.008, noise_floor × 3)
-             - Piso mínimo 0.008: preserva fala suave a ~60 cm do mic (RMS ~0.01)
-               sem deixar passar silêncio puro (RMS < 0.003).
-             - Fator ×3 (era ×4): menos agressivo — mantém fala a distância
-               média enquanto zera eco de alto-falante (tipicamente < noise×2).
-          3. Normalização de pico para 0.95.
+        SESSÃO 08 — REMOÇÃO DE FILTROS DESTRUTIVOS:
+        O filtro passa-banda (300-3400 Hz) e o noise gate manual da Sessão 07
+        causaram loops de alucinação no Whisper ao eliminar informação fonética
+        essencial (sibilantes, fricativas) e criar descontinuidades digitais.
 
-        Por que na saída do AudioEngine e não na entrada?
-        Processar em tempo real exigiria latência e sincronismo entre as
-        3 threads. Pós-processar o WAV final é mais simples, robusto e
-        não afeta o desempenho de captura.
+        Pipeline simplificado:
+          1. Filtro Passa-Alta (High-Pass) Butterworth em 80 Hz (ordem 2):
+             - Remove apenas rumble (hum elétrico 50/60 Hz, vibrações mecânicas).
+             - Preserva TODAS as frequências de voz (≥85 Hz) e sibilantes (4-8 kHz).
+             - Ordem 2: transição suave, sem ringing artifacts.
+
+          2. Normalização de pico para -0.5 dB (0.95):
+             - Previne clipping sem compressão ou alteração de dinâmica.
+
+        O VAD nativo do Whisper (Silero VAD) cuida dos silêncios — nenhum gate
+        manual é necessário.
+
+        Por que na saída do AudioEngine?
+        Pós-processar o WAV final é mais robusto que filtrar em tempo real
+        (evita latência, sincronismo entre threads e overhead de CPU).
         """
         if not _SCIPY_AVAILABLE:
             logger.warning("[Preprocess] scipy indisponível — pré-processamento ignorado.")
@@ -413,34 +410,21 @@ class AudioEngine:
                 "chunked" if _use_chunked else "in-memory",
             )
 
-            # ── Coeficientes do filtro passa-banda ──
-            nyq  = sr / 2.0
-            low  = 80.0 / nyq
-            high = min(7500.0 / nyq, 0.99)
-            sos  = sps.butter(4, [low, high], btype="bandpass", output="sos")
-
-            # ── Noise gate config ──
-            _FRAME = 512
-            _MIN_THRESHOLD = 0.008
+            # ── Coeficientes do filtro High-Pass (Butterworth ordem 2, 80 Hz) ──
+            nyq = sr / 2.0
+            low_cutoff = 80.0 / nyq  # Remove apenas rumble/hum, preserva voz (≥85 Hz)
+            sos = sps.butter(2, low_cutoff, btype="highpass", output="sos")
 
             if _use_chunked:
                 # === MODO CHUNKED: processa em blocos de 5 min ===
                 self._on_status(
-                    f"⟳ Pré-processando {duration_min:.0f} min de áudio em blocos..."
+                    f"⟳ Aplicando High-Pass (80 Hz) em {duration_min:.0f} min de áudio..."
                 )
 
-                # Passo 1: estima noise floor dos primeiros 0.5s
-                with sf.SoundFile(str(wav_path), mode="r") as reader:
-                    probe = reader.read(int(0.5 * sr), dtype="float32")
-                noise_floor = _estimate_noise_floor(probe, sr, window_secs=0.5, frame=_FRAME)
-                del probe
-                _GATE_THRESHOLD = max(_MIN_THRESHOLD, noise_floor * 3.0)
-
-                # Passo 2: processa blocos → arquivo temporário
+                # Processa blocos → arquivo temporário
                 tmp_path = wav_path.with_suffix(".tmp.wav")
                 peak = 0.0
                 zi = sps.sosfilt_zi(sos)  # estado do filtro entre blocos
-                # sosfilt_zi retorna shape (n_sections, 2); para 1D data é OK
 
                 with sf.SoundFile(str(wav_path), mode="r") as reader, \
                      sf.SoundFile(str(tmp_path), mode="w", samplerate=sr,
@@ -451,18 +435,11 @@ class AudioEngine:
                         if len(chunk) == 0:
                             break
 
-                        # Bandpass com estado contínuo entre blocos
+                        # High-Pass com estado contínuo entre blocos
                         chunk, zi = sps.sosfilt(sos, chunk, zi=zi)
                         chunk = chunk.astype(np.float32)
 
-                        # Noise gate
-                        for i in range(0, len(chunk), _FRAME):
-                            frame = chunk[i : i + _FRAME]
-                            rms = float(np.sqrt(np.mean(frame ** 2)))
-                            if rms < _GATE_THRESHOLD:
-                                chunk[i : i + _FRAME] = 0.0
-
-                        # Track peak para normalização no passo 3
+                        # Track peak para normalização
                         chunk_peak = float(np.max(np.abs(chunk)))
                         if chunk_peak > peak:
                             peak = chunk_peak
@@ -471,11 +448,11 @@ class AudioEngine:
                         blocks_done += 1
                         if blocks_done % 4 == 0:  # a cada ~20 min
                             self._on_status(
-                                f"⟳ Pré-processando... "
+                                f"⟳ Processando... "
                                 f"{blocks_done * 5:.0f}/{duration_min:.0f} min"
                             )
 
-                # Passo 3: normalização de pico (lê tmp, escreve final)
+                # Normalização de pico (lê tmp, escreve final)
                 if peak > 0:
                     scale = np.float32(0.95 / peak)
                     with sf.SoundFile(str(tmp_path), mode="r") as reader, \
@@ -496,20 +473,10 @@ class AudioEngine:
                 # === MODO IN-MEMORY: arquivos curtos (<30 min) ===
                 data, sr = sf.read(str(wav_path), dtype="float32")
 
-                # 1. Filtro passa-banda 80–7500 Hz
+                # 1. Filtro High-Pass 80 Hz
                 data = sps.sosfilt(sos, data).astype(np.float32)
 
-                # 2. Noise gate ADAPTATIVO
-                noise_floor = _estimate_noise_floor(data, sr, window_secs=0.5, frame=_FRAME)
-                _GATE_THRESHOLD = max(_MIN_THRESHOLD, noise_floor * 3.0)
-
-                for i in range(0, len(data), _FRAME):
-                    frame = data[i : i + _FRAME]
-                    rms = float(np.sqrt(np.mean(frame ** 2)))
-                    if rms < _GATE_THRESHOLD:
-                        data[i : i + _FRAME] = 0.0
-
-                # 3. Normalização de pico
+                # 2. Normalização de pico
                 peak = float(np.max(np.abs(data)))
                 if peak > 0:
                     data = (data / peak * 0.95).astype(np.float32)
@@ -517,13 +484,10 @@ class AudioEngine:
                 sf.write(str(wav_path), data, sr, subtype="PCM_16")
 
             logger.info(
-                "[Preprocess] Noise floor estimado: %.4f → gate adaptativo: %.4f",
-                noise_floor,
-                _GATE_THRESHOLD,
+                "[Preprocess] High-Pass (80 Hz) + Normalização (-0.5 dB) aplicados."
             )
             self._on_status(
-                f"✔ Filtros de áudio aplicados "
-                f"(noise floor: {noise_floor:.4f} → gate: {_GATE_THRESHOLD:.4f})."
+                "✔ High-Pass (80 Hz) aplicado — sinal pronto para transcrição."
             )
             logger.info("[Preprocess] WAV pós-processado com sucesso: %s", wav_path)
 

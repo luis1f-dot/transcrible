@@ -136,7 +136,7 @@ _CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "whisper"
 # duração real do WAV. Este valor é o TETO máximo.
 _TRANSCRIPTION_TIMEOUT_MAX: int = 14_400  # 4 h
 
-ModelSize = Literal["tiny", "base", "small"]
+ModelSize = Literal["base", "small", "medium"]  # SESSÃO 08: tiny removido, medium adicionado
 
 
 class TranscriptionEngine:
@@ -226,6 +226,11 @@ class TranscriptionEngine:
                     # └───────────────────────────────────────────────────┘
                     temperature=0,
                     condition_on_previous_text=False,
+                    # ── SESSÃO 08: Initial Prompt forte ──
+                    # Ancora o contexto do modelo, reduzindo alucinações de 
+                    # domínio (palavras em inglês, termos técnicos aleatórios).
+                    # O prompt NÃO é transcrito — apenas condiciona o decoder.
+                    initial_prompt="A seguir, a transcrição de uma reunião de trabalho em português:",
                     no_speech_threshold=0.6,
                     log_prob_threshold=-1.0,
                     compression_ratio_threshold=2.4,
