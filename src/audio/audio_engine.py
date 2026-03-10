@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -166,24 +167,40 @@ class AudioEngine:
 
     def list_devices(self) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
         """
-        Enumera microfones e loopbacks WASAPI disponíveis no sistema.
+        Dispatcher que roteia a enumeração de dispositivos baseado na plataforma.
 
-        Por que dois universos de índices?
-        pyaudiowpatch usa um PortAudio *patchado* que expõe streams WASAPI loopback
-        extras — esses dispositivos NÃO existem no índice do sounddevice (PortAudio
-        padrão). Para distingui-los sem mudar a assinatura pública de start(), os
-        índices pyaudiowpatch são retornados com _PAWP_OFFSET somado. start() detecta
-        e separa esses índices antes de iniciar as threads.
+        Arquitetura:
+          - Windows (sys.platform == "win32"): usa _list_devices_windows()
+          - Linux (sys.platform == "linux"): usa _list_devices_linux()
+
+        Princípio Aberto/Fechado (OCP): cada plataforma tem sua própria rota,
+        sem mesclagem ou alteração da lógica existente validada.
+
+        Retorna:
+            mics      — lista de (encoded_index, nome_display)
+            loopbacks — lista de (encoded_index, nome_display)
+        """
+        if sys.platform == "win32":
+            return self._list_devices_windows()
+        elif sys.platform == "linux":
+            return self._list_devices_linux()
+        else:
+            # Fallback para outras plataformas
+            logger.warning("[Devices] Plataforma desconhecida (%s) — tentando Windows.", sys.platform)
+            return self._list_devices_windows()
+
+    def _list_devices_windows(self) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+        """
+        Enumeração de microfones e loopbacks no Windows via WASAPI.
 
         Estratégia de detecção de loopbacks (duas camadas):
           1. pyaudiowpatch.get_loopback_device_info_generator() — API dedicada WASAPI
              loopback Windows. Índices usados: _PAWP_OFFSET + pawp_index.
           2. Fallback sounddevice: heurística por nome ("loopback" / is_loopback)
-             dentro do host API WASAPI, para ambientes sem pyaudiowpatch. Índice
-             direto do sounddevice (sem offset).
+             dentro do host API WASAPI. Índice direto do sounddevice (sem offset).
 
         Microfones: todos os host APIs (MME, DirectSound, WASAPI, WDM-KS)
-        são incluídos, usando índices sounddevice diretos.
+        usando índices sounddevice diretos.
 
         Retorna:
             mics      — lista de (encoded_index, nome_display)
@@ -265,6 +282,57 @@ class AudioEngine:
         logger.info("[Devices] Total: %d mic(s), %d loopback(s).", len(mics), len(loopbacks))
         return mics, loopbacks
 
+    def _list_devices_linux(self) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+        """
+        Enumeração de microfones e loopbacks no Linux via PulseAudio/PipeWire.
+
+        No Linux, os "loopbacks" são representados como "Monitors" do PulseAudio.
+        Detectamos através de:
+          - **Microfones:** `max_input_channels > 0` e sem "monitor" no nome
+          - **Loopbacks:** `max_input_channels > 0` e com "monitor" no nome
+
+        Todos os índices são diretos do sounddevice (sem offset).
+
+        Retorna:
+            mics      — lista de (index, nome_display)
+            loopbacks — lista de (index, nome_display)
+        """
+        mics: list[tuple[int, str]] = []
+        loopbacks: list[tuple[int, str]] = []
+
+        try:
+            devices  = sd.query_devices()
+            hostapis = sd.query_hostapis()
+
+            for idx, dev in enumerate(devices):
+                if dev["max_input_channels"] <= 0:
+                    continue
+
+                name         = dev["name"]
+                hostapi_name = hostapis[dev["hostapi"]]["name"].upper()
+
+                # Detecção heurística: "monitor" no nome indica loopback
+                is_monitor = "monitor" in name.lower()
+
+                if is_monitor:
+                    loopbacks.append((idx, f"[Loopback] {name}"))
+                    logger.info("[Devices-Linux] Loopback/Monitor (idx=%d): %s", idx, name)
+                else:
+                    mics.append((idx, name))
+                    logger.info("[Devices-Linux] Microfone (idx=%d, hostapi=%s): %s", idx, hostapi_name, name)
+
+        except Exception as exc:
+            logger.error("[Devices-Linux] Erro ao listar devices sounddevice: %s", exc)
+            self._on_status(f"[ERRO] Falha ao listar microfones no Linux: {exc}")
+
+        if not loopbacks:
+            loopbacks.append((-1, "[Aviso] Nenhum loopback/monitor encontrado"))
+        if not mics:
+            mics.append((-1, "[Aviso] Nenhum microfone encontrado"))
+
+        logger.info("[Devices-Linux] Total: %d mic(s), %d loopback(s).", len(mics), len(loopbacks))
+        return mics, loopbacks
+
     def start(
         self,
         mic_index: int,
@@ -276,14 +344,16 @@ class AudioEngine:
 
         Args:
             mic_index:      índice do device de input (microfone).
-            loopback_index: índice do device de loopback WASAPI.
+            loopback_index: índice do device de loopback WASAPI (Windows) ou Monitor (Linux).
             output_dir:     diretório onde `temp_meeting.wav` será gravado.
         """
         self._stop_event.clear()
         self._output_path = output_dir / "temp_meeting.wav"
 
         # ── Detecta se o índice de loopback é um índice pyaudiowpatch ───────────
-        if loopback_index >= _PAWP_OFFSET:
+        # Apenas no Windows: pyaudiowpatch deve ser usado se loopback_index >= _PAWP_OFFSET.
+        # Em Linux, nunca usamos pyaudiowpatch.
+        if sys.platform == "win32" and loopback_index >= _PAWP_OFFSET:
             self._loopback_via_pawp = True
             self._loopback_pawp_idx = loopback_index - _PAWP_OFFSET
             # Consulta SR diretamente no pyaudiowpatch
@@ -546,16 +616,19 @@ class AudioEngine:
 
     def _capture_loopback(self, device_index: int) -> None:
         """
-        Thread B — captura loopback WASAPI.
+        Thread B — captura loopback usando a estratégia correta para a plataforma.
 
-        Duas estratégias de captura, escolhidas em start():
-          A. pyaudiowpatch (self._loopback_via_pawp=True): usa PyAudio.open() com
-             leitura bloqueante. Necessário para devices WASAPI loopback que não
-             aparecem no universo do sounddevice.
-          B. sounddevice (padrão): InputStream callback — mantido para loopbacks
-             detectados via fallback heurístico ou quando pyaudiowpatch não existe.
+        Roteamento:
+          - Windows (sys.platform == "win32"):
+              * pyaudiowpatch se disponível (self._loopback_via_pawp=True)
+              * Fallback sounddevice para loopbacks heurísticos
+          - Linux (sys.platform == "linux"):
+              * sounddevice direto para monitors (PulseAudio/PipeWire)
+              * Sem pyaudiowpatch
 
         Se device_index < 0 (não encontrado): graceful degradation com silêncio.
+
+        Princípio: cada plataforma tem sua rota isolada, sem mesclagem.
         """
         # ── Sem loopback disponível ── grava só microfone ────────────────────
         if device_index < 0:
@@ -567,6 +640,25 @@ class AudioEngine:
             self._loopback_queue.put(None)
             return
 
+        # ── Roteamento por plataforma ────────────────────────────────────────
+        if sys.platform == "win32":
+            self._capture_loopback_windows(device_index)
+        elif sys.platform == "linux":
+            self._capture_loopback_linux(device_index)
+        else:
+            # Fallback para outras plataformas: tenta estratégia Windows
+            logger.warning("[Loopback] Plataforma desconhecida (%s) — tentando estratégia Windows.", sys.platform)
+            self._capture_loopback_windows(device_index)
+
+    def _capture_loopback_windows(self, device_index: int) -> None:
+        """
+        Captura loopback no Windows usando pyaudiowpatch ou sounddevice.
+
+        Duas estratégias:
+          A. pyaudiowpatch (self._loopback_via_pawp=True): PyAudio.open() com
+             leitura bloqueante. Necessário para devices WASAPI loopback nativo.
+          B. sounddevice (padrão): InputStream callback — fallback heurístico.
+        """
         # ── Estratégia A: pyaudiowpatch (loopback WASAPI nativo) ─────────────
         if self._loopback_via_pawp and _PAWP_AVAILABLE:
             self._on_status(f"▶ Loopback WASAPI via pyaudiowpatch (idx={self._loopback_pawp_idx})")
@@ -603,10 +695,10 @@ class AudioEngine:
                 self._loopback_queue.put(None)
             return
 
-        # ── Estratégia B: sounddevice InputStream (fallback heurístico) ──────
+        # ── Estratégia B: sounddevice InputStream (fallback WASAPI) ──────────
         def _callback(indata: np.ndarray, frames: int, time, status) -> None:  # noqa: ARG001
             if status:
-                logger.warning("[Loopback-SD] %s", status)
+                logger.warning("[Loopback-SD-Windows] %s", status)
             if not self._stop_event.is_set():
                 self._loopback_queue.put(_to_mono(indata.copy()))
 
@@ -622,7 +714,40 @@ class AudioEngine:
             ):
                 self._stop_event.wait()
         except sd.PortAudioError as exc:
-            logger.error("[Loopback-SD] PortAudioError: %s", exc)
+            logger.error("[Loopback-SD-Windows] PortAudioError: %s", exc)
+            self._on_status(f"[AVISO] Loopback falhou ({exc}) — gravando só microfone.")
+        finally:
+            self._loopback_queue.put(None)
+
+    def _capture_loopback_linux(self, device_index: int) -> None:
+        """
+        Captura de loopback/monitor no Linux via sounddevice + PulseAudio/PipeWire.
+
+        Estratégia simples:
+          - Abre InputStream para o índice do monitor (já identificado em list_devices)
+          - Usa callback para empurrar chunks à fila
+
+        Sem pyaudiowpatch, sem complex lógica WASAPI — apenas sounddevice direto.
+        """
+        def _callback(indata: np.ndarray, frames: int, time, status) -> None:  # noqa: ARG001
+            if status:
+                logger.warning("[Loopback-Linux] %s", status)
+            if not self._stop_event.is_set():
+                self._loopback_queue.put(_to_mono(indata.copy()))
+
+        self._on_status(f"▶ Loopback/Monitor Linux (sounddevice idx={device_index})")
+        try:
+            with sd.InputStream(
+                device=device_index,
+                channels=1,
+                samplerate=self._loopback_sr,
+                blocksize=BLOCK_SIZE,
+                dtype="float32",
+                callback=_callback,
+            ):
+                self._stop_event.wait()
+        except sd.PortAudioError as exc:
+            logger.error("[Loopback-Linux] PortAudioError: %s", exc)
             self._on_status(f"[AVISO] Loopback falhou ({exc}) — gravando só microfone.")
         finally:
             self._loopback_queue.put(None)

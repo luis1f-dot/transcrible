@@ -4,6 +4,7 @@
 
 import sys
 from pathlib import Path
+from unittest.mock import patch, MagicMock, call
 
 import numpy as np
 import pytest
@@ -11,7 +12,7 @@ import pytest
 # Garante que src/ esteja no path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from audio.audio_engine import _normalize, _mix, _resample, _to_mono, _estimate_noise_floor, TARGET_SR
+from audio.audio_engine import _normalize, _mix, _resample, _to_mono, _estimate_noise_floor, TARGET_SR, AudioEngine
 
 
 # ── _normalize ────────────────────────────────────────────────────────────
@@ -174,3 +175,164 @@ def test_noise_floor_empty_array_returns_zero():
     """Array vazio não deve lançar exceção — retorna 0.0."""
     floor = _estimate_noise_floor(np.array([], dtype=np.float32), sr=16_000)
     assert floor == 0.0
+
+
+# ── Testes de Roteamento por Plataforma (Sessão 09 — Suporte Linux) ────────
+
+class TestAudioEngineRouting:
+    """
+    Testes de roteamento de plataforma para garantir isolamento de SO
+    e prevenir regressão da lógica Windows.
+    """
+
+    @pytest.fixture
+    def mock_on_status(self):
+        """Mock do callback de status."""
+        return MagicMock()
+
+    @pytest.fixture
+    def engine(self, mock_on_status):
+        """Cria instância de AudioEngine com callback mockado."""
+        return AudioEngine(on_status=mock_on_status)
+
+    def test_list_devices_routing_windows(self, engine):
+        """
+        Teste de roteamento: quando sys.platform == 'win32',
+        list_devices() deve chamar _list_devices_windows() e NÃO _list_devices_linux().
+
+        Garante que a lógica Windows não é alterada e Windows-specific features
+        (pyaudiowpatch, WASAPI fallback) continuam siendo usadas.
+        """
+        with patch.object(engine, "_list_devices_windows", return_value=([], [])) as mock_windows, \
+             patch.object(engine, "_list_devices_linux", return_value=([], [])) as mock_linux, \
+             patch("sys.platform", "win32"):
+            
+            # Força reimportar o módulo com sys.platform mocked
+            mics, loopbacks = engine.list_devices()
+            
+            # Verifica que apenas Windows foi chamado
+            mock_windows.assert_called_once()
+            mock_linux.assert_not_called()
+
+    def test_list_devices_routing_linux(self, engine):
+        """
+        Teste de roteamento: quando sys.platform == 'linux',
+        list_devices() deve chamar _list_devices_linux() e NÃO _list_devices_windows().
+
+        Garante que a lógica Linux isolada é invocada corretamente
+        e Windows-specific features não interferem.
+        """
+        with patch.object(engine, "_list_devices_windows", return_value=([], [])) as mock_windows, \
+             patch.object(engine, "_list_devices_linux", return_value=([], [])) as mock_linux, \
+             patch("sys.platform", "linux"):
+            
+            mics, loopbacks = engine.list_devices()
+            
+            # Verifica que apenas Linux foi chamado
+            mock_linux.assert_called_once()
+            mock_windows.assert_not_called()
+
+    def test_capture_loopback_routing_windows(self, engine, mock_on_status):
+        """
+        Teste de roteamento: quando sys.platform == 'win32' e device_index >= 0,
+        _capture_loopback() deve chamar _capture_loopback_windows()
+        e NÃO _capture_loopback_linux().
+        """
+        device_index = 5
+        with patch.object(engine, "_capture_loopback_windows") as mock_windows, \
+             patch.object(engine, "_capture_loopback_linux") as mock_linux, \
+             patch("sys.platform", "win32"):
+            
+            engine._capture_loopback(device_index)
+            
+            mock_windows.assert_called_once_with(device_index)
+            mock_linux.assert_not_called()
+
+    def test_capture_loopback_routing_linux(self, engine, mock_on_status):
+        """
+        Teste de roteamento: quando sys.platform == 'linux' e device_index >= 0,
+        _capture_loopback() deve chamar _capture_loopback_linux()
+        e NÃO _capture_loopback_windows().
+        """
+        device_index = 3
+        with patch.object(engine, "_capture_loopback_windows") as mock_windows, \
+             patch.object(engine, "_capture_loopback_linux") as mock_linux, \
+             patch("sys.platform", "linux"):
+            
+            engine._capture_loopback(device_index)
+            
+            mock_linux.assert_called_once_with(device_index)
+            mock_windows.assert_not_called()
+
+    def test_capture_loopback_graceful_degradation_no_device(self, engine, mock_on_status):
+        """
+        Teste de robustez: quando device_index < 0 (loopback não disponível),
+        _capture_loopback() deve fazer graceful degradation (silêncio)
+        sem chamar as rotas platform-specific.
+        """
+        device_index = -1
+        with patch.object(engine, "_capture_loopback_windows") as mock_windows, \
+             patch.object(engine, "_capture_loopback_linux") as mock_linux:
+            
+            # _capture_loopback() com device_index < 0.
+            # Deve encerrar rapidamente, enfileirar None e retornar.
+            engine._stop_event.set()  # sinaliza parada imediata
+            engine._capture_loopback(device_index)
+            
+            # Nenhuma estratégia platform-specific deve ser invocada
+            mock_windows.assert_not_called()
+            mock_linux.assert_not_called()
+            
+            # Fila deve ter None (poison pill)
+            result = engine._loopback_queue.get(timeout=1.0)
+            assert result is None
+
+    def test_start_preserves_windows_pawp_logic(self, engine, mock_on_status):
+        """
+        Teste de regressão: start() deve preservar a lógica pyaudiowpatch
+        apenas no Windows quando loopback_index >= _PAWP_OFFSET.
+
+        Garante que o isolamento não quebra a deteção de índices PAWP.
+        """
+        from audio.audio_engine import _PAWP_OFFSET
+        import tempfile
+        
+        mic_index = 0
+        loopback_index = _PAWP_OFFSET + 5  # simula índice PAWP
+        output_dir = Path(tempfile.gettempdir())
+        
+        with patch("sys.platform", "win32"), \
+             patch("sounddevice.query_devices", return_value=[{"default_samplerate": 16000}]), \
+             patch("audio.audio_engine.pa.PyAudio") as mock_pa:
+            
+            mock_pa_instance = MagicMock()
+            mock_pa.return_value = mock_pa_instance
+            mock_pa_instance.get_device_info_by_index.return_value = {"defaultSampleRate": 16000}
+            
+            engine.start(mic_index, loopback_index, output_dir)
+            
+            # Verificar que _loopback_via_pawp foi setado para True
+            assert engine._loopback_via_pawp is True
+            assert engine._loopback_pawp_idx == 5
+
+    def test_start_disables_pawp_on_linux(self, engine, mock_on_status):
+        """
+        Teste de isolamento: start() no Linux nunca deve setar _loopback_via_pawp = True,
+        mesmo que loopback_index >= _PAWP_OFFSET (improvável, mas garante robustez).
+
+        Previne que pyaudiowpatch seja invocado em ambientes Linux.
+        """
+        from audio.audio_engine import _PAWP_OFFSET
+        import tempfile
+        
+        mic_index = 0
+        loopback_index = _PAWP_OFFSET + 5  # mesmo com PAWP offset
+        output_dir = Path(tempfile.gettempdir())
+        
+        with patch("sys.platform", "linux"), \
+             patch("sounddevice.query_devices", return_value=[{"default_samplerate": 16000}]):
+            
+            engine.start(mic_index, loopback_index, output_dir)
+            
+            # No Linux, _loopback_via_pawp deve ser SEMPRE False
+            assert engine._loopback_via_pawp is False
