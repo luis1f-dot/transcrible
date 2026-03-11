@@ -4,7 +4,7 @@
 .venv/
 venv/
 env/
-/.agent
+
 # Cache Python
 __pycache__/
 *.py[cod]
@@ -21,9 +21,9 @@ temp_meeting.wav
 
 # Outputs de transcrição gerados pelo app
 *.txt
-*.md
+
 !README.md
-!.agent/*.md
+
 
 # IDEs
 .vscode/
