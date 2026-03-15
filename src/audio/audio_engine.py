@@ -416,10 +416,26 @@ class AudioEngine:
         self._mic_queue.put(None)
         self._loopback_queue.put(None)
 
+        threads_alive = []
         for t in self._threads:
             t.join(timeout=STOP_TIMEOUT)
             if t.is_alive():
-                logger.warning("Thread %s não encerrou dentro do timeout.", t.name)
+                logger.warning(
+                    "[Stop] Thread %s não encerrou dentro do timeout de %.1fs.",
+                    t.name, STOP_TIMEOUT
+                )
+                threads_alive.append(t.name)
+
+        if threads_alive:
+            self._on_status(
+                f"[AVISO] {len(threads_alive)} thread(s) não encerraram: {', '.join(threads_alive)}. "
+                "Recursos podem não ter sido liberados corretamente."
+            )
+            logger.error(
+                "[Stop] Threads pendentes após timeout: %s. "
+                "Possível vazamento de recursos de áudio — considere reiniciar a aplicação.",
+                threads_alive
+            )
 
         # Pós-processamento: melhora qualidade do sinal antes da transcrição
         if self._output_path and self._output_path.exists():
@@ -662,6 +678,8 @@ class AudioEngine:
         # ── Estratégia A: pyaudiowpatch (loopback WASAPI nativo) ─────────────
         if self._loopback_via_pawp and _PAWP_AVAILABLE:
             self._on_status(f"▶ Loopback WASAPI via pyaudiowpatch (idx={self._loopback_pawp_idx})")
+            _pa = None
+            stream = None
             try:
                 _pa = pa.PyAudio()
                 lb_info = _pa.get_device_info_by_index(self._loopback_pawp_idx)
@@ -685,13 +703,31 @@ class AudioEngine:
                         self._loopback_queue.put(_to_mono(chunk))
                     except Exception as read_exc:
                         logger.warning("[Loopback-PAWP] Erro na leitura: %s", read_exc)
-                stream.stop_stream()
-                stream.close()
-                _pa.terminate()
+                        break  # sai do loop em caso de erro de leitura
             except Exception as exc:
                 logger.error("[Loopback-PAWP] Falhou: %s", exc)
                 self._on_status(f"[AVISO] Loopback PAWP falhou ({exc}) — gravando só microfone.")
             finally:
+                # ── Cleanup CRÍTICO: sempre executado, mesmo com exceção ─────
+                # Garante que recursos WASAPI sejam liberados em todos os cenários
+                # (stop normal, exceção, timeout, interrupção de thread).
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                        logger.debug("[Loopback-PAWP] stream.stop_stream() executado.")
+                    except Exception as stop_exc:
+                        logger.warning("[Loopback-PAWP] Erro em stop_stream(): %s", stop_exc)
+                    try:
+                        stream.close()
+                        logger.debug("[Loopback-PAWP] stream.close() executado.")
+                    except Exception as close_exc:
+                        logger.warning("[Loopback-PAWP] Erro em close(): %s", close_exc)
+                if _pa is not None:
+                    try:
+                        _pa.terminate()
+                        logger.info("[Loopback-PAWP] PyAudio.terminate() executado — recursos WASAPI liberados.")
+                    except Exception as term_exc:
+                        logger.error("[Loopback-PAWP] Erro em terminate(): %s", term_exc)
                 self._loopback_queue.put(None)
             return
 
